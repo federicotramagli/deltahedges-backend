@@ -1,0 +1,99 @@
+import { Router } from "express";
+import {
+  activateSlotSchema,
+  createSlotSchema,
+  slotAccountsSchema,
+  slotParametersSchema,
+} from "@deltahedge/shared";
+import { requireAuth } from "../auth/supabase-auth.js";
+import type { AuthedRequest } from "../types/http.js";
+import {
+  activateSlot,
+  createSlot,
+  getSlotById,
+  listSlotsForUser,
+  listTradesForSlot,
+  pauseSlot,
+  upsertSlotAccounts,
+  upsertSlotParameters,
+} from "../services/slot-service.js";
+
+export const slotsRouter = Router();
+
+slotsRouter.use(requireAuth);
+
+slotsRouter.get("/", (request, response, next) => {
+  const authedRequest = request as AuthedRequest;
+  void listSlotsForUser(authedRequest.auth.userId)
+    .then((payload) => {
+      response.json(payload);
+    })
+    .catch(next);
+});
+
+slotsRouter.post("/", (request, response, next) => {
+  const authedRequest = request as AuthedRequest;
+  const body = createSlotSchema.parse(request.body);
+  void createSlot(authedRequest.auth.userId, body)
+    .then((slot) => {
+      response.status(201).json({ slot });
+    })
+    .catch(next);
+});
+
+slotsRouter.get("/:slotId", (request, response, next) => {
+  const authedRequest = request as AuthedRequest<unknown, { slotId: string }>;
+  void getSlotById(authedRequest.auth.userId, authedRequest.params.slotId)
+    .then((slot) => {
+      response.json({ slot });
+    })
+    .catch(next);
+});
+
+slotsRouter.post("/:slotId/accounts", (request, response, next) => {
+  const authedRequest = request as AuthedRequest<unknown, { slotId: string }>;
+  const body = slotAccountsSchema.parse(request.body);
+  void upsertSlotAccounts(authedRequest.auth.userId, authedRequest.params.slotId, body)
+    .then((slot) => {
+      response.json({ slot });
+    })
+    .catch(next);
+});
+
+slotsRouter.post("/:slotId/parameters", (request, response, next) => {
+  const authedRequest = request as AuthedRequest<unknown, { slotId: string }>;
+  const body = slotParametersSchema.parse(request.body);
+  void upsertSlotParameters(authedRequest.auth.userId, authedRequest.params.slotId, body)
+    .then((slot) => {
+      response.json({ slot });
+    })
+    .catch(next);
+});
+
+slotsRouter.post("/:slotId/activate", (request, response, next) => {
+  const authedRequest = request as AuthedRequest<unknown, { slotId: string }>;
+  const body = activateSlotSchema.parse(request.body);
+  void activateSlot(authedRequest.auth.userId, authedRequest.params.slotId, body.phase)
+    .then((slot) => {
+      response.json({ slot });
+    })
+    .catch(next);
+});
+
+slotsRouter.post("/:slotId/pause", (request, response, next) => {
+  const authedRequest = request as AuthedRequest<unknown, { slotId: string }>;
+  void pauseSlot(authedRequest.auth.userId, authedRequest.params.slotId, false)
+    .then((slot) => {
+      response.json({ slot });
+    })
+    .catch(next);
+});
+
+slotsRouter.get("/:slotId/trades", (request, response, next) => {
+  const authedRequest = request as AuthedRequest<unknown, { slotId: string }>;
+  void listTradesForSlot(authedRequest.auth.userId, authedRequest.params.slotId)
+    .then((trades) => {
+      response.json({ trades });
+    })
+    .catch(next);
+});

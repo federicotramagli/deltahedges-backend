@@ -1,0 +1,21 @@
+{
+  "name": "@deltahedge/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@deltahedge/shared": "file:../../packages/shared",
+    "bullmq": "^5.61.0",
+    "dotenv": "^17.2.3",
+    "ioredis": "^5.8.1",
+    "pg": "^8.16.3",
+    "pino": "^10.1.0"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.15.5"
+  }
+}

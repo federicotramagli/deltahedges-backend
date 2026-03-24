@@ -1,0 +1,23 @@
+{
+  "name": "deltahedges-backend",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:api": "npm run dev -w @deltahedge/api",
+    "dev:worker": "npm run dev -w @deltahedge/worker",
+    "build:shared": "npm run build -w @deltahedge/shared",
+    "build:api": "npm run build -w @deltahedge/shared && npm run build -w @deltahedge/api",
+    "build:worker": "npm run build -w @deltahedge/shared && npm run build -w @deltahedge/worker",
+    "typecheck": "tsc -b packages/shared apps/api apps/worker",
+    "test": "tsx --test packages/shared/src/**/*.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^24.8.1",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}
