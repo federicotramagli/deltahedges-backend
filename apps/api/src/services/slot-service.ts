@@ -10,6 +10,7 @@ import {
 import { pool } from "../db/pool.js";
 import { decryptSecret, encryptSecret } from "./crypto-service.js";
 import {
+  ensureSingleMetaApiAccount,
   getMetaApiAccountConnectionSnapshot,
   provisionMetaApiAccount,
 } from "./metaapi-service.js";
@@ -78,6 +79,14 @@ type StoredTradingAccountRow = {
   account_name: string | null;
 };
 
+type ReusableTradingAccountRow = {
+  metaapi_account_id: string | null;
+  platform: "mt4" | "mt5";
+  login_ciphertext: string | null;
+  password_ciphertext: string | null;
+  server_ciphertext: string | null;
+};
+
 function sameEncryptedSecret(ciphertext: string | null, plain: string) {
   if (!ciphertext) return false;
   return decryptSecret(ciphertext) === plain;
@@ -91,6 +100,7 @@ async function reuseOrProvisionMetaAccount(
   if (mode === "reuse" && existingAccountId) {
     try {
       const snapshot = await getMetaApiAccountConnectionSnapshot(existingAccountId);
+      await ensureSingleMetaApiAccount(input, snapshot.accountId);
       return {
         accountId: snapshot.accountId,
         deploymentState:
@@ -103,6 +113,46 @@ async function reuseOrProvisionMetaAccount(
   }
 
   return provisionMetaApiAccount(input);
+}
+
+async function findReusableTradingAccountForUser(
+  client: PoolClient,
+  userId: string,
+  accountType: "PROP" | "BROKER",
+  resolved: {
+    platform: "mt4" | "mt5";
+    login: string;
+    password: string;
+    server: string;
+  },
+) {
+  const result = await client.query<ReusableTradingAccountRow>(
+    `
+      select
+        metaapi_account_id,
+        platform,
+        login_ciphertext,
+        password_ciphertext,
+        server_ciphertext
+      from trading_accounts
+      where user_id = $1
+        and account_type = $2
+        and metaapi_account_id is not null
+    `,
+    [userId, accountType],
+  );
+
+  return (
+    result.rows.find((row) => {
+      return (
+        row.metaapi_account_id &&
+        row.platform === resolved.platform &&
+        sameEncryptedSecret(row.login_ciphertext, resolved.login) &&
+        sameEncryptedSecret(row.password_ciphertext, resolved.password) &&
+        sameEncryptedSecret(row.server_ciphertext, resolved.server)
+      );
+    }) ?? null
+  );
 }
 
 function maskLogin(login: string) {
@@ -602,8 +652,43 @@ export async function upsertSlotAccounts(
       ) &&
       sameEncryptedSecret(existingBrokerAccount?.server_ciphertext ?? null, resolvedBroker.server);
 
+    const reusablePropTradingAccount = await findReusableTradingAccountForUser(
+      client,
+      userId,
+      "PROP",
+      {
+        platform: resolvedProp.platform,
+        login: resolvedProp.login,
+        password: resolvedProp.password,
+        server: resolvedProp.server,
+      },
+    );
+
+    const reusableBrokerTradingAccount = await findReusableTradingAccountForUser(
+      client,
+      userId,
+      "BROKER",
+      {
+        platform: resolvedBroker.platform,
+        login: resolvedBroker.login,
+        password: resolvedBroker.password,
+        server: resolvedBroker.server,
+      },
+    );
+
+    const propMetaApiAccountId =
+      existingPropAccount?.metaapi_account_id ??
+      reusablePropTradingAccount?.metaapi_account_id ??
+      null;
+    const brokerMetaApiAccountId =
+      existingBrokerAccount?.metaapi_account_id ??
+      reusableBrokerTradingAccount?.metaapi_account_id ??
+      null;
+
     const propMeta = await reuseOrProvisionMetaAccount(
-      propUnchanged ? "reuse" : "provision",
+      propUnchanged || Boolean(reusablePropTradingAccount?.metaapi_account_id)
+        ? "reuse"
+        : "provision",
       {
         slotId,
         accountType: "PROP",
@@ -612,12 +697,14 @@ export async function upsertSlotAccounts(
         password: resolvedProp.password,
         server: resolvedProp.server,
         proxyIp: proxy.ipAddress,
-        existingAccountId: existingPropAccount?.metaapi_account_id ?? null,
+        existingAccountId: propMetaApiAccountId,
       },
-      existingPropAccount?.metaapi_account_id ?? null,
+      propMetaApiAccountId,
     );
     const brokerMeta = await reuseOrProvisionMetaAccount(
-      brokerUnchanged ? "reuse" : "provision",
+      brokerUnchanged || Boolean(reusableBrokerTradingAccount?.metaapi_account_id)
+        ? "reuse"
+        : "provision",
       {
         slotId,
         accountType: "BROKER",
@@ -626,9 +713,9 @@ export async function upsertSlotAccounts(
         password: resolvedBroker.password,
         server: resolvedBroker.server,
         proxyIp: proxy.ipAddress,
-        existingAccountId: existingBrokerAccount?.metaapi_account_id ?? null,
+        existingAccountId: brokerMetaApiAccountId,
       },
-      existingBrokerAccount?.metaapi_account_id ?? null,
+      brokerMetaApiAccountId,
     );
 
     await upsertSavedAccountForUser(

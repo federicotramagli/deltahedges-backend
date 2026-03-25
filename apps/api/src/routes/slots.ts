@@ -19,6 +19,7 @@ import {
 } from "../services/slot-service.js";
 
 export const slotsRouter = Router();
+const activeSlotAccountSyncs = new Set<string>();
 
 slotsRouter.use(requireAuth);
 
@@ -53,11 +54,24 @@ slotsRouter.get("/:slotId", (request, response, next) => {
 slotsRouter.post("/:slotId/accounts", (request, response, next) => {
   const authedRequest = request as AuthedRequest<unknown, { slotId: string }>;
   const body = slotAccountsSchema.parse(request.body);
+  const lockKey = `${authedRequest.auth.userId}:${authedRequest.params.slotId}`;
+
+  if (activeSlotAccountSyncs.has(lockKey)) {
+    response.status(409).json({
+      error: "Connection sync already running for this slot",
+    });
+    return;
+  }
+
+  activeSlotAccountSyncs.add(lockKey);
   void upsertSlotAccounts(authedRequest.auth.userId, authedRequest.params.slotId, body)
     .then((slot) => {
       response.json({ slot });
     })
-    .catch(next);
+    .catch(next)
+    .finally(() => {
+      activeSlotAccountSyncs.delete(lockKey);
+    });
 });
 
 slotsRouter.post("/:slotId/parameters", (request, response, next) => {

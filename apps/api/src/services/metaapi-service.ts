@@ -460,6 +460,13 @@ async function cleanupDuplicateMetaApiAccounts(
   }
 }
 
+export async function ensureSingleMetaApiAccount(
+  input: ProvisionMetaApiAccountInput,
+  keepAccountId: string,
+) {
+  await cleanupDuplicateMetaApiAccounts(input, keepAccountId);
+}
+
 async function requestMetaApiClient<T>(
   accountId: string,
   path: string,
