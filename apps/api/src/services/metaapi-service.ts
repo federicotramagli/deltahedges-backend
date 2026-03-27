@@ -691,11 +691,19 @@ export async function ensureSingleMetaApiAccount(
   await cleanupDuplicateMetaApiAccounts(input, keepAccountId);
 }
 
+type MetaApiClientRequestOptions = {
+  retries?: number;
+  delayMs?: number;
+};
+
 async function requestMetaApiClient<T>(
   accountId: string,
   path: string,
   init: RequestInit,
+  options: MetaApiClientRequestOptions = {},
 ): Promise<T | null> {
+  const retries = options.retries ?? 0;
+  const delayMs = options.delayMs ?? 1500;
   const account = await readMetaApiAccount(accountId, 1);
   const clientRegion = account.region ?? config.METAAPI_REGION;
   const response = await fetch(
@@ -724,6 +732,26 @@ async function requestMetaApiClient<T>(
       payload as MetaApiErrorPayload,
       `MetaApi client request failed (${response.status})`,
     );
+
+    if (retries > 0 && isMetaApiAccountNotReadyTradeError(message)) {
+      logger.warn(
+        {
+          accountId,
+          path,
+          status: response.status,
+          region: clientRegion,
+          retriesLeft: retries,
+          message,
+        },
+        "MetaApi client request not ready yet, retrying",
+      );
+
+      await sleep(delayMs);
+      return requestMetaApiClient<T>(accountId, path, init, {
+        retries: retries - 1,
+        delayMs,
+      });
+    }
 
     logger.error(
       {
@@ -772,6 +800,7 @@ export async function getMetaApiAccountLiveMetrics(
     accountId,
     `/users/current/accounts/${accountId}/account-information`,
     { method: "GET" },
+    { retries: 20, delayMs: 2000 },
   );
 
   const balance = toNullableMoney(accountInformation?.balance);
@@ -791,6 +820,7 @@ async function listMetaApiPositions(accountId: string): Promise<MetaApiPositionD
     accountId,
     `/users/current/accounts/${accountId}/positions`,
     { method: "GET" },
+    { retries: 20, delayMs: 2000 },
   );
 
   return Array.isArray(positions) ? positions : [];
@@ -878,6 +908,7 @@ export async function getMetaApiSymbolPrice(
     accountId,
     `/users/current/accounts/${accountId}/symbols/${normalizedSymbol}/current-price?keepSubscription=true`,
     { method: "GET" },
+    { retries: 20, delayMs: 1500 },
   );
 
   const bid = toNullableNumber(payload?.bid);
@@ -914,6 +945,7 @@ export async function getMetaApiSymbolSpecification(
     accountId,
     `/users/current/accounts/${accountId}/symbols/${normalizedSymbol}/specification`,
     { method: "GET" },
+    { retries: 20, delayMs: 1500 },
   );
   const tickSize = toNullableNumber(payload?.tickSize);
 
@@ -1033,6 +1065,55 @@ export async function waitUntilMetaApiAccountConnected(
   }
 
   throw new Error(`MetaApi account ${accountId} did not reach CONNECTED state`);
+}
+
+export async function waitUntilMetaApiAccountReady(
+  accountId: string,
+  options: { retries?: number; delayMs?: number } = {},
+) {
+  const retries = options.retries ?? 90;
+  const delayMs = options.delayMs ?? 2000;
+  let lastStatus: string | null = null;
+
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    const snapshot = await getMetaApiAccountConnectionSnapshot(accountId);
+    lastStatus = snapshot.connectionStatus;
+
+    if (snapshot.connectionStatus === "CONNECTED") {
+      try {
+        await requestMetaApiClient<MetaApiAccountInformationDto>(
+          accountId,
+          `/users/current/accounts/${accountId}/account-information`,
+          { method: "GET" },
+          { retries: 2, delayMs: 1500 },
+        );
+
+        return await readMetaApiAccount(accountId, 1);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+
+        if (!isMetaApiAccountNotReadyTradeError(message)) {
+          throw error;
+        }
+      }
+    }
+
+    if (isMetaApiConnectionFailureStatus(snapshot.connectionStatus)) {
+      throw new Error(
+        `MetaApi account ${accountId} entered failure state (${snapshot.connectionStatus}). Check credentials and server.`,
+      );
+    }
+
+    if (attempt === retries) {
+      throw new Error(
+        `MetaApi account ${accountId} did not become client-ready in time (last status: ${lastStatus ?? "UNKNOWN"}).`,
+      );
+    }
+
+    await sleep(delayMs);
+  }
+
+  throw new Error(`MetaApi account ${accountId} did not become client-ready`);
 }
 
 async function deployMetaApiAccount(accountId: string) {

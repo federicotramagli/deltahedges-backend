@@ -8,7 +8,7 @@ import {
   getMetaApiAccountConnectionSnapshot,
   getMetaApiAccountLiveMetrics,
   provisionMetaApiAccount,
-  waitUntilMetaApiAccountConnected,
+  waitUntilMetaApiAccountReady,
 } from "./metaapi-service.js";
 import { assertAvailableSeatForUser } from "./seat-service.js";
 import { refreshTradingAccountConnectionsForUser } from "./trading-account-connection-service.js";
@@ -373,8 +373,8 @@ async function validateSavedAccountConnection(
     });
     provisionedAccountId = provisioned.accountId;
 
-    await waitUntilMetaApiAccountConnected(provisioned.accountId, {
-      retries: 20,
+    await waitUntilMetaApiAccountReady(provisioned.accountId, {
+      retries: 90,
       delayMs: 2000,
     });
 
@@ -452,8 +452,8 @@ async function refreshSavedAccountConnection(
         !isMetaApiConnectionFailureStatus(snapshot.connectionStatus)
       ) {
         try {
-          await waitUntilMetaApiAccountConnected(row.metaapi_account_id, {
-            retries: 6,
+          await waitUntilMetaApiAccountReady(row.metaapi_account_id, {
+            retries: 18,
             delayMs: 1500,
           });
           snapshot = await getMetaApiAccountConnectionSnapshot(row.metaapi_account_id);
