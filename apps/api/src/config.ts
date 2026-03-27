@@ -53,6 +53,25 @@ export const allowedFrontendOrigins = Array.from(
   ),
 );
 
+export function isAllowedFrontendOrigin(origin: string) {
+  if (allowedFrontendOrigins.includes(origin)) {
+    return true;
+  }
+
+  try {
+    const parsed = new URL(origin);
+    const hostname = parsed.hostname.toLowerCase();
+
+    if (hostname === "deltahedges.com") {
+      return true;
+    }
+
+    return hostname.endsWith(".deltahedges.com");
+  } catch {
+    return false;
+  }
+}
+
 export const adminEmails = new Set(
   config.ADMIN_EMAILS.split(",")
     .map((value) => value.trim().toLowerCase())

@@ -1,6 +1,6 @@
 import cors from "cors";
 import express from "express";
-import { allowedFrontendOrigins, config } from "./config.js";
+import { config, isAllowedFrontendOrigin } from "./config.js";
 import { logger } from "./logger.js";
 import { healthRouter } from "./routes/health.js";
 import { performanceRouter } from "./routes/performance.js";
@@ -20,7 +20,7 @@ export function createApp() {
           return;
         }
 
-        if (allowedFrontendOrigins.includes(origin)) {
+        if (isAllowedFrontendOrigin(origin)) {
           callback(null, true);
           return;
         }
