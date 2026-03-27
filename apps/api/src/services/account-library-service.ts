@@ -111,13 +111,7 @@ function isMetaApiConnectionFailureStatus(status: string | null | undefined) {
 
 function shouldRefreshPendingSavedAccount(row: SavedAccountRow) {
   if (row.deleted_at) return false;
-  if (row.connection_state !== "pending") return false;
-  if (!row.last_validated_at) return true;
-
-  const lastValidatedAt = Date.parse(row.last_validated_at);
-  if (Number.isNaN(lastValidatedAt)) return true;
-
-  return Date.now() - lastValidatedAt >= 15_000;
+  return row.connection_state === "pending";
 }
 
 async function findMatchingSavedAccountRow(
