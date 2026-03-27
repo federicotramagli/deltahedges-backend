@@ -587,6 +587,19 @@ async function deleteMetaApiAccount(accountId: string) {
   });
 }
 
+async function clearMetaApiRegistryAccountId(accountId: string) {
+  await pool.query(
+    `
+      update metaapi_account_registry
+      set metaapi_account_id = null,
+          last_validated_at = now(),
+          updated_at = now()
+      where metaapi_account_id = $1
+    `,
+    [accountId],
+  );
+}
+
 async function findReusableMetaApiAccount(
   input: ProvisionMetaApiAccountInput,
 ): Promise<MetaApiAccountDto | null> {
@@ -1114,6 +1127,18 @@ export async function waitUntilMetaApiAccountReady(
   }
 
   throw new Error(`MetaApi account ${accountId} did not become client-ready`);
+}
+
+export async function destroyMetaApiAccount(accountId: string) {
+  try {
+    await deleteMetaApiAccount(accountId);
+  } catch (error) {
+    if (!isMetaApiNotFoundError(error)) {
+      throw error;
+    }
+  } finally {
+    await clearMetaApiRegistryAccountId(accountId).catch(() => null);
+  }
 }
 
 async function deployMetaApiAccount(accountId: string) {
