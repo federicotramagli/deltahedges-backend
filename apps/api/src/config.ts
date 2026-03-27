@@ -2,7 +2,7 @@ import "dotenv/config";
 import { z } from "zod";
 
 const rawPort =
-  process.env.API_PORT ?? process.env.PORT ?? process.env.port ?? "8080";
+  process.env.PORT ?? process.env.API_PORT ?? process.env.port ?? "8080";
 
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
