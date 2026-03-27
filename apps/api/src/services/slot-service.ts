@@ -6,6 +6,7 @@ import {
   type ChallengeName,
   type SlotAccountConnectionState,
   type SlotSnapshot,
+  type TradeDirection,
 } from "@deltahedge/shared";
 import { adminEmails } from "../config.js";
 import { pool } from "../db/pool.js";
@@ -938,6 +939,112 @@ export async function getStoredSlotAccounts(userId: string, slotId: string) {
           }
         : null,
     };
+  } finally {
+    client.release();
+  }
+}
+
+export async function recordOpenedTradePair(
+  userId: string,
+  slotId: string,
+  input: {
+    phase: "Fase 1" | "Fase 2" | "Funded";
+    symbol: string;
+    direction: TradeDirection;
+    propTicketId?: string | null;
+    brokerTicketId?: string | null;
+    propLotSize: number;
+    brokerLotRaw: number;
+    brokerLotFinal: number;
+  },
+) {
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+
+    const openTrade = await client.query<{ id: string }>(
+      `
+        select id
+        from trade_pairs
+        where user_id = $1
+          and slot_id = $2
+          and status in ('PENDING', 'OPEN')
+        limit 1
+      `,
+      [userId, slotId],
+    );
+
+    if (openTrade.rowCount) {
+      throw new Error("This slot already has an open trade pair");
+    }
+
+    const tradeResult = await client.query<{
+      id: string;
+      phase: "Fase 1" | "Fase 2" | "Funded";
+      symbol: string;
+      direction: TradeDirection;
+      prop_lot_size: string;
+      broker_lot_final: string;
+    }>(
+      `
+        insert into trade_pairs (
+          user_id, slot_id, phase, symbol, direction, status,
+          prop_ticket_id, broker_ticket_id,
+          prop_lot_size, broker_lot_raw, broker_lot_final,
+          open_time
+        )
+        values ($1, $2, $3, $4, $5, 'OPEN', $6, $7, $8, $9, $10, now())
+        returning id, phase, symbol, direction, prop_lot_size, broker_lot_final
+      `,
+      [
+        userId,
+        slotId,
+        input.phase,
+        input.symbol,
+        input.direction,
+        input.propTicketId ?? null,
+        input.brokerTicketId ?? null,
+        input.propLotSize,
+        input.brokerLotRaw,
+        input.brokerLotFinal,
+      ],
+    );
+
+    const trade = tradeResult.rows[0]!;
+
+    await client.query(
+      `
+        update slot_runtime
+        set current_trade_pair_id = $2,
+            last_entry_time = now(),
+            trade_count_today = trade_count_today + 1,
+            updated_at = now()
+        where slot_id = $1
+      `,
+      [slotId, trade.id],
+    );
+
+    await client.query("commit");
+
+    await publishRuntimeEvent({
+      event: "trade_pair.opened",
+      userId,
+      slotId,
+      payload: {
+        id: trade.id,
+        phase: trade.phase,
+        symbol: trade.symbol,
+        direction: trade.direction,
+        propLotSize: Number(trade.prop_lot_size),
+        brokerLotSize: Number(trade.broker_lot_final),
+      },
+      emittedAt: new Date().toISOString(),
+    });
+
+    return trade;
+  } catch (error) {
+    await client.query("rollback");
+    throw error;
   } finally {
     client.release();
   }

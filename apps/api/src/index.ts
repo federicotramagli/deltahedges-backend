@@ -4,6 +4,7 @@ import { ensureDatabaseCompatibility } from "./db/compatibility.js";
 import { pool } from "./db/pool.js";
 import { logger } from "./logger.js";
 import { createApp } from "./app.js";
+import { startEquityWatcher, stopEquityWatcher } from "./services/equity-watcher-service.js";
 import { attachRuntimeGateway } from "./websocket/gateway.js";
 
 const app = createApp();
@@ -24,8 +25,18 @@ server.listen(config.API_PORT, "0.0.0.0", () => {
 });
 
 void ensureDatabaseCompatibility();
+if (config.METAAPI_ACCESS_TOKEN) {
+  startEquityWatcher(config.EQUITY_WATCHER_INTERVAL_MS);
+}
 
 process.on("SIGINT", async () => {
+  stopEquityWatcher();
+  await pool.end();
+  server.close(() => process.exit(0));
+});
+
+process.on("SIGTERM", async () => {
+  stopEquityWatcher();
   await pool.end();
   server.close(() => process.exit(0));
 });

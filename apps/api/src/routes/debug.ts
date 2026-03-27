@@ -10,10 +10,13 @@ import type { AuthedRequest } from "../types/http.js";
 import {
   getMetaApiAccountLiveMetrics,
   getMetaApiAccountConnectionSnapshot,
+  closeMetaApiPositions,
   submitMetaApiTrade,
 } from "../services/metaapi-service.js";
-import { getStoredSlotAccounts } from "../services/slot-service.js";
-import { config } from "../config.js";
+import {
+  getStoredSlotAccounts,
+  recordOpenedTradePair,
+} from "../services/slot-service.js";
 import { logger } from "../logger.js";
 
 const debugTestExecutionSchema = z.object({
@@ -307,11 +310,6 @@ debugRouter.post("/live-metrics", async (request, response, next) => {
 });
 
 debugRouter.post("/test-execution", async (request, response, next) => {
-  if (config.NODE_ENV === "production") {
-    response.status(404).json({ error: "Not found" });
-    return;
-  }
-
   const authedRequest = request as AuthedRequest;
   const parsed = debugTestExecutionSchema.parse(request.body);
   const testKey = `${authedRequest.auth.userId}:${parsed.slotId}`;
@@ -402,6 +400,28 @@ debugRouter.post("/test-execution", async (request, response, next) => {
       propTradeResult.status === "fulfilled" &&
       brokerTradeResult.status === "fulfilled"
     ) {
+      try {
+        await withStage("trade pair persistence", () =>
+          recordOpenedTradePair(authedRequest.auth.userId, parsed.slotId, {
+            phase: parsed.phase,
+            symbol,
+            direction: propDirection,
+            propTicketId: propTradeResult.value.orderId ?? null,
+            brokerTicketId: brokerTradeResult.value.orderId ?? null,
+            propLotSize: propLot,
+            brokerLotRaw: brokerLot.raw,
+            brokerLotFinal: brokerLot.rounded,
+          }),
+        );
+      } catch (persistenceError) {
+        await Promise.allSettled([
+          closeMetaApiPositions(propAccountId, { symbol }),
+          closeMetaApiPositions(brokerAccountId, { symbol }),
+        ]);
+
+        throw persistenceError;
+      }
+
       response.json({
         logs: [
           "Connection successfully established on prop account",

@@ -50,6 +50,11 @@ interface MetaApiAccountInformationDto {
   equity?: number | string;
 }
 
+interface MetaApiPositionDto {
+  id?: string | number;
+  symbol?: string;
+}
+
 export interface MetaApiAccountLiveMetricsSnapshot
   extends MetaApiAccountConnectionSnapshot {
   balance: number | null;
@@ -98,6 +103,11 @@ export interface SubmitMetaApiTradeResult {
   numericCode?: number;
   stringCode?: string;
   message?: string;
+}
+
+export interface CloseMetaApiPositionsResult {
+  matchedPositions: number;
+  closedPositions: number;
 }
 
 function createTransactionId() {
@@ -559,6 +569,61 @@ export async function getMetaApiAccountLiveMetrics(
     equity,
     unrealizedPnl:
       balance !== null && equity !== null ? toNullableMoney(equity - balance) : null,
+  };
+}
+
+async function listMetaApiPositions(accountId: string): Promise<MetaApiPositionDto[]> {
+  const positions = await requestMetaApiClient<MetaApiPositionDto[]>(
+    accountId,
+    `/users/current/accounts/${accountId}/positions`,
+    { method: "GET" },
+  );
+
+  return Array.isArray(positions) ? positions : [];
+}
+
+async function closeMetaApiPositionById(
+  accountId: string,
+  positionId: string,
+): Promise<SubmitMetaApiTradeResult | null> {
+  return requestMetaApiClient<SubmitMetaApiTradeResult>(
+    accountId,
+    `/users/current/accounts/${accountId}/trade`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        actionType: "POSITION_CLOSE_ID",
+        positionId,
+      }),
+    },
+  );
+}
+
+export async function closeMetaApiPositions(
+  accountId: string,
+  options?: { symbol?: string | null },
+): Promise<CloseMetaApiPositionsResult> {
+  const positions = await listMetaApiPositions(accountId);
+  const normalizedSymbol = options?.symbol?.trim().toUpperCase() || null;
+  const matchingPositions = positions.filter((position) => {
+    if (!normalizedSymbol) return true;
+    return String(position.symbol ?? "").trim().toUpperCase() === normalizedSymbol;
+  });
+
+  let closedPositions = 0;
+  for (const position of matchingPositions) {
+    const positionId = position.id === undefined || position.id === null ? null : String(position.id);
+    if (!positionId) {
+      continue;
+    }
+
+    await closeMetaApiPositionById(accountId, positionId);
+    closedPositions += 1;
+  }
+
+  return {
+    matchedPositions: matchingPositions.length,
+    closedPositions,
   };
 }
 
