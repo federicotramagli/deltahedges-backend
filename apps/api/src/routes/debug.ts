@@ -8,12 +8,14 @@ import { z } from "zod";
 import { requireAuth } from "../auth/supabase-auth.js";
 import type { AuthedRequest } from "../types/http.js";
 import {
+  getMetaApiOpenPositions,
   getMetaApiAccountLiveMetrics,
   getMetaApiAccountConnectionSnapshot,
   closeMetaApiPositions,
   submitMetaApiTrade,
 } from "../services/metaapi-service.js";
 import {
+  closeOpenTradePairForSlot,
   getOpenTradePairForSlot,
   getStoredSlotAccounts,
   recordOpenedTradePair,
@@ -356,11 +358,23 @@ debugRouter.post("/test-execution", async (request, response, next) => {
     parsed.slotId,
   );
   if (existingOpenPair) {
-    activeExecutionTests.delete(testKey);
-    response.status(409).json({
-      error: `This slot already has an open trade pair on ${existingOpenPair.symbol} (${existingOpenPair.direction}). Close it first before running another test.`,
-    });
-    return;
+    const [propOpenPositions, brokerOpenPositions] = await Promise.all([
+      getMetaApiOpenPositions(propAccountId, { symbol: existingOpenPair.symbol }),
+      getMetaApiOpenPositions(brokerAccountId, { symbol: existingOpenPair.symbol }),
+    ]);
+
+    if (propOpenPositions.length === 0 && brokerOpenPositions.length === 0) {
+      await closeOpenTradePairForSlot(authedRequest.auth.userId, parsed.slotId, {
+        tradePairId: existingOpenPair.id,
+        reason: "Stale open trade pair cleaned before new test execution",
+      });
+    } else {
+      activeExecutionTests.delete(testKey);
+      response.status(409).json({
+        error: `This slot already has an open trade pair on ${existingOpenPair.symbol} (${existingOpenPair.direction}). Close it first before running another test.`,
+      });
+      return;
+    }
   }
 
   const propLot = Number(parsed.propLot.toFixed(2));

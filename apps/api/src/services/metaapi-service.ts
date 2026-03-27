@@ -55,6 +55,11 @@ interface MetaApiPositionDto {
   symbol?: string;
 }
 
+export interface MetaApiOpenPositionSnapshot {
+  id: string;
+  symbol: string;
+}
+
 export interface MetaApiAccountLiveMetricsSnapshot
   extends MetaApiAccountConnectionSnapshot {
   balance: number | null;
@@ -580,6 +585,26 @@ async function listMetaApiPositions(accountId: string): Promise<MetaApiPositionD
   );
 
   return Array.isArray(positions) ? positions : [];
+}
+
+export async function getMetaApiOpenPositions(
+  accountId: string,
+  options?: { symbol?: string | null },
+): Promise<MetaApiOpenPositionSnapshot[]> {
+  const positions = await listMetaApiPositions(accountId);
+  const normalizedSymbol = options?.symbol?.trim().toUpperCase() || null;
+
+  return positions
+    .map((position) => ({
+      id:
+        position.id === undefined || position.id === null ? "" : String(position.id),
+      symbol: String(position.symbol ?? "").trim().toUpperCase(),
+    }))
+    .filter((position) => position.id && position.symbol)
+    .filter((position) => {
+      if (!normalizedSymbol) return true;
+      return position.symbol === normalizedSymbol;
+    });
 }
 
 async function closeMetaApiPositionById(

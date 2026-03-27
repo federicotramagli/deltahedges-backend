@@ -1078,6 +1078,100 @@ export async function getOpenTradePairForSlot(userId: string, slotId: string) {
   }
 }
 
+export async function closeOpenTradePairForSlot(
+  userId: string,
+  slotId: string,
+  options?: {
+    tradePairId?: string | null;
+    reason?: string;
+  },
+) {
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+
+    const existingTrade = options?.tradePairId
+      ? await client.query<{ id: string }>(
+          `
+            select id
+            from trade_pairs
+            where id = $1
+              and user_id = $2
+              and slot_id = $3
+              and status in ('PENDING', 'OPEN')
+            limit 1
+          `,
+          [options.tradePairId, userId, slotId],
+        )
+      : await client.query<{ id: string }>(
+          `
+            select id
+            from trade_pairs
+            where user_id = $1
+              and slot_id = $2
+              and status in ('PENDING', 'OPEN')
+            order by created_at desc
+            limit 1
+          `,
+          [userId, slotId],
+        );
+
+    if (!existingTrade.rowCount) {
+      await client.query("rollback");
+      return null;
+    }
+
+    const tradePairId = existingTrade.rows[0]!.id;
+
+    await client.query(
+      `
+        update trade_pairs
+        set status = 'CLOSED',
+            close_time = now(),
+            updated_at = now()
+        where id = $1
+      `,
+      [tradePairId],
+    );
+
+    await client.query(
+      `
+        update slot_runtime
+        set current_trade_pair_id = null,
+            updated_at = now()
+        where slot_id = $1
+      `,
+      [slotId],
+    );
+
+    if (options?.reason) {
+      await client.query(
+        `
+          insert into risk_events (user_id, slot_id, severity, event_type, message, metadata)
+          values ($1, $2, 'info', 'FORCED_CLOSE', $3, $4::jsonb)
+        `,
+        [
+          userId,
+          slotId,
+          options.reason,
+          JSON.stringify({
+            tradePairId,
+            reason: options.reason,
+          }),
+        ],
+      );
+    }
+
+    await client.query("commit");
+    return tradePairId;
+  } catch (error) {
+    await client.query("rollback");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 export async function upsertSlotParameters(
   userId: string,
   slotId: string,
