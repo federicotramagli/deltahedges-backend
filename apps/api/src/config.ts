@@ -1,6 +1,9 @@
 import "dotenv/config";
 import { z } from "zod";
 
+const rawPort =
+  process.env.API_PORT ?? process.env.PORT ?? process.env.port ?? "8080";
+
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   API_PORT: z.coerce.number().default(8080),
@@ -29,7 +32,10 @@ const envSchema = z.object({
 
 export type ApiConfig = z.infer<typeof envSchema>;
 
-export const config = envSchema.parse(process.env);
+export const config = envSchema.parse({
+  ...process.env,
+  API_PORT: rawPort,
+});
 
 export const allowedFrontendOrigins = Array.from(
   new Set(
