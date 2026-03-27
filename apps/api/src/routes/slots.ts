@@ -64,7 +64,9 @@ slotsRouter.post("/:slotId/accounts", (request, response, next) => {
   }
 
   activeSlotAccountSyncs.add(lockKey);
-  void upsertSlotAccounts(authedRequest.auth.userId, authedRequest.params.slotId, body)
+  void upsertSlotAccounts(authedRequest.auth.userId, authedRequest.params.slotId, body, {
+    email: authedRequest.auth.email,
+  })
     .then((slot) => {
       response.json({ slot });
     })

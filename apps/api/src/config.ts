@@ -23,6 +23,7 @@ const envSchema = z.object({
   METAAPI_ACCESS_TOKEN: z.string().optional(),
   METAAPI_REGION: z.string().default("new-york"),
   METAAPI_DEFAULT_PLATFORM: z.enum(["mt4", "mt5"]).default("mt5"),
+  ADMIN_EMAILS: z.string().default("trafede123@gmail.com"),
   METAAPI_ALLOCATE_DEDICATED_IP: z
     .enum(["true", "false"])
     .default("false")
@@ -48,4 +49,10 @@ export const allowedFrontendOrigins = Array.from(
       "http://localhost:5173",
     ].filter(Boolean),
   ),
+);
+
+export const adminEmails = new Set(
+  config.ADMIN_EMAILS.split(",")
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean),
 );

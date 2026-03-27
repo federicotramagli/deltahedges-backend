@@ -7,6 +7,7 @@ import {
   type SlotAccountConnectionState,
   type SlotSnapshot,
 } from "@deltahedge/shared";
+import { adminEmails } from "../config.js";
 import { pool } from "../db/pool.js";
 import { decryptSecret, encryptSecret } from "./crypto-service.js";
 import {
@@ -549,17 +550,24 @@ export async function upsertSlotAccounts(
       lotStep: number;
     };
   },
+  options?: {
+    email?: string;
+  },
 ) {
   const client = await pool.connect();
   try {
     await client.query("begin");
+    const isAdminUser =
+      typeof options?.email === "string" &&
+      adminEmails.has(options.email.trim().toLowerCase());
     const billingCountry = await getBillingCountry(client, userId);
-
-    const proxy = await assignDedicatedProxyForUser({
-      client,
-      userId,
-      billingCountry,
-    });
+    const proxy = isAdminUser
+      ? null
+      : await assignDedicatedProxyForUser({
+          client,
+          userId,
+          billingCountry,
+        });
 
     const existingAccounts = await client.query<StoredTradingAccountRow>(
       `
@@ -722,7 +730,7 @@ export async function upsertSlotAccounts(
         login: resolvedProp.login,
         password: resolvedProp.password,
         server: resolvedProp.server,
-        proxyIp: proxy.ipAddress,
+        proxyIp: proxy?.ipAddress,
         existingAccountId: propMetaApiAccountId,
       },
       propMetaApiAccountId,
@@ -738,7 +746,7 @@ export async function upsertSlotAccounts(
         login: resolvedBroker.login,
         password: resolvedBroker.password,
         server: resolvedBroker.server,
-        proxyIp: proxy.ipAddress,
+        proxyIp: proxy?.ipAddress,
         existingAccountId: brokerMetaApiAccountId,
       },
       brokerMetaApiAccountId,
@@ -856,7 +864,14 @@ export async function upsertSlotAccounts(
             updated_at = now()
         where id = $1 and user_id = $2
       `,
-      [slotId, userId, input.challenge, resolvedBroker.accountName, billingCountry, proxy.id],
+      [
+        slotId,
+        userId,
+        input.challenge,
+        resolvedBroker.accountName,
+        billingCountry,
+        proxy?.id ?? null,
+      ],
     );
 
     await client.query("commit");
