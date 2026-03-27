@@ -92,12 +92,9 @@ async function listWatchedSlots() {
         on broker.slot_id = hs.id and broker.account_type = 'BROKER'
       left join trade_pairs tp
         on tp.id = sr.current_trade_pair_id and tp.status = 'OPEN'
-      where prop.metaapi_account_id is not null
+      where hs.runtime_status = 'RUNNING'
+        and prop.metaapi_account_id is not null
         and broker.metaapi_account_id is not null
-        and (
-          hs.runtime_status = 'RUNNING'
-          or sr.current_trade_pair_id is not null
-        )
     `,
   );
 
@@ -155,7 +152,12 @@ function buildExitDecision(params: {
 
   if (params.forcedCloseAt) {
     const forcedCloseAtMs = Date.parse(params.forcedCloseAt);
-    if (!Number.isNaN(forcedCloseAtMs) && Date.now() >= forcedCloseAtMs) {
+    const maxForcedCloseLagMs = 3 * 60 * 60 * 1000;
+    if (
+      !Number.isNaN(forcedCloseAtMs) &&
+      Date.now() >= forcedCloseAtMs &&
+      Date.now() - forcedCloseAtMs <= maxForcedCloseLagMs
+    ) {
       return {
         type: "FORCED_CLOSE" as const,
         message: `Forced close reached at ${params.forcedCloseAt}`,

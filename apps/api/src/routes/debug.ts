@@ -14,6 +14,7 @@ import {
   submitMetaApiTrade,
 } from "../services/metaapi-service.js";
 import {
+  getOpenTradePairForSlot,
   getStoredSlotAccounts,
   recordOpenedTradePair,
 } from "../services/slot-service.js";
@@ -346,6 +347,18 @@ debugRouter.post("/test-execution", async (request, response, next) => {
     response.status(409).json({
       error:
         "Save slot connections first. This slot does not have both MetaApi account ids saved yet.",
+    });
+    return;
+  }
+
+  const existingOpenPair = await getOpenTradePairForSlot(
+    authedRequest.auth.userId,
+    parsed.slotId,
+  );
+  if (existingOpenPair) {
+    activeExecutionTests.delete(testKey);
+    response.status(409).json({
+      error: `This slot already has an open trade pair on ${existingOpenPair.symbol} (${existingOpenPair.direction}). Close it first before running another test.`,
     });
     return;
   }

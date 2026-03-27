@@ -1050,6 +1050,34 @@ export async function recordOpenedTradePair(
   }
 }
 
+export async function getOpenTradePairForSlot(userId: string, slotId: string) {
+  const client = await pool.connect();
+  try {
+    const result = await client.query<{
+      id: string;
+      symbol: string;
+      direction: TradeDirection;
+      phase: "Fase 1" | "Fase 2" | "Funded";
+      open_time: string | null;
+    }>(
+      `
+        select id, symbol, direction, phase, open_time
+        from trade_pairs
+        where user_id = $1
+          and slot_id = $2
+          and status in ('PENDING', 'OPEN')
+        order by created_at desc
+        limit 1
+      `,
+      [userId, slotId],
+    );
+
+    return result.rows[0] ?? null;
+  } finally {
+    client.release();
+  }
+}
+
 export async function upsertSlotParameters(
   userId: string,
   slotId: string,
