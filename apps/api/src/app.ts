@@ -1,6 +1,6 @@
 import cors from "cors";
 import express from "express";
-import { config } from "./config.js";
+import { allowedFrontendOrigins, config } from "./config.js";
 import { logger } from "./logger.js";
 import { healthRouter } from "./routes/health.js";
 import { performanceRouter } from "./routes/performance.js";
@@ -14,7 +14,19 @@ export function createApp() {
 
   app.use(
     cors({
-      origin: config.FRONTEND_ORIGIN,
+      origin(origin, callback) {
+        if (!origin) {
+          callback(null, true);
+          return;
+        }
+
+        if (allowedFrontendOrigins.includes(origin)) {
+          callback(null, true);
+          return;
+        }
+
+        callback(new Error(`Origin not allowed by CORS: ${origin}`));
+      },
       credentials: true,
     }),
   );

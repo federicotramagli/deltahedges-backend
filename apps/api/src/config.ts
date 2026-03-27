@@ -30,3 +30,16 @@ const envSchema = z.object({
 export type ApiConfig = z.infer<typeof envSchema>;
 
 export const config = envSchema.parse(process.env);
+
+export const allowedFrontendOrigins = Array.from(
+  new Set(
+    [
+      ...config.FRONTEND_ORIGIN.split(",").map((value) => value.trim()).filter(Boolean),
+      "https://deltahedges.com",
+      "https://app.deltahedges.com",
+      "http://127.0.0.1:4177",
+      "http://localhost:4177",
+      "http://localhost:5173",
+    ].filter(Boolean),
+  ),
+);
