@@ -11,6 +11,7 @@ import { logger } from "../logger.js";
 import {
   closeMetaApiPositions,
   getMetaApiAccountLiveMetrics,
+  getMetaApiOpenPositions,
 } from "./metaapi-service.js";
 import { publishRuntimeEvent } from "./runtime-events.js";
 import { getSlotById } from "./slot-service.js";
@@ -34,6 +35,8 @@ type WatchedSlotRow = {
   broker_metaapi_account_id: string | null;
   trade_pair_id: string | null;
   symbol: string | null;
+  prop_ticket_id: string | null;
+  broker_ticket_id: string | null;
 };
 
 type ExitDecision =
@@ -82,7 +85,9 @@ async function listWatchedSlots() {
         prop.metaapi_account_id as prop_metaapi_account_id,
         broker.metaapi_account_id as broker_metaapi_account_id,
         tp.id as trade_pair_id,
-        tp.symbol
+        tp.symbol,
+        tp.prop_ticket_id,
+        tp.broker_ticket_id
       from hedging_slots hs
       join slot_parameters sp on sp.slot_id = hs.id
       join slot_runtime sr on sr.slot_id = hs.id
@@ -92,13 +97,23 @@ async function listWatchedSlots() {
         on broker.slot_id = hs.id and broker.account_type = 'BROKER'
       left join trade_pairs tp
         on tp.id = sr.current_trade_pair_id and tp.status = 'OPEN'
-      where hs.runtime_status = 'RUNNING'
-        and prop.metaapi_account_id is not null
+      where prop.metaapi_account_id is not null
         and broker.metaapi_account_id is not null
+        and (
+          hs.runtime_status = 'RUNNING'
+          or tp.id is not null
+        )
     `,
   );
 
   return result.rows;
+}
+
+function isSyntheticTradePair(row: WatchedSlotRow) {
+  return (
+    row.prop_ticket_id?.startsWith("prop_") === true &&
+    row.broker_ticket_id?.startsWith("broker_") === true
+  );
 }
 
 function buildExitDecision(params: {
@@ -167,6 +182,65 @@ function buildExitDecision(params: {
   }
 
   return null;
+}
+
+function buildPostCloseSyncDecision(params: {
+  challenge: ChallengeName;
+  phase: SlotPhase;
+  riskPerTrade: number;
+  propEquity: number | null;
+  source: "PROP_CLOSED" | "BROKER_CLOSED" | "BOTH_CLOSED";
+}) {
+  const startingBalance = getChallengeAccountSize(params.challenge);
+  const hardFailEquity = startingBalance * 0.9;
+  const phasePassEquity =
+    params.phase === "Fase 1"
+      ? startingBalance * 1.08
+      : params.phase === "Fase 2"
+        ? startingBalance * 1.05
+        : null;
+  const riskStopEquity = startingBalance * (1 - params.riskPerTrade / 100);
+
+  if (params.propEquity !== null && params.propEquity <= hardFailEquity) {
+    return {
+      type: "HARD_FAIL" as const,
+      message: `Prop equity closed below hard fail threshold (${params.propEquity.toFixed(2)} <= ${hardFailEquity.toFixed(2)})`,
+      riskEventType: "HARD_FAIL" as const,
+    };
+  }
+
+  if (
+    phasePassEquity !== null &&
+    params.propEquity !== null &&
+    params.propEquity >= phasePassEquity
+  ) {
+    return {
+      type: "PHASE_PASS" as const,
+      message: `Prop leg closed on target (${params.propEquity.toFixed(2)} >= ${phasePassEquity.toFixed(2)})`,
+      riskEventType: "PHASE_PASSED" as const,
+    };
+  }
+
+  if (params.propEquity !== null && params.propEquity <= riskStopEquity) {
+    return {
+      type: "RISK_STOP" as const,
+      message: `Prop leg closed on stop (${params.propEquity.toFixed(2)} <= ${riskStopEquity.toFixed(2)})`,
+      riskEventType: "FORCED_CLOSE" as const,
+    };
+  }
+
+  const sourceMessage =
+    params.source === "PROP_CLOSED"
+      ? "Prop leg closed first. Broker leg closed immediately to keep the pair synchronized."
+      : params.source === "BROKER_CLOSED"
+        ? "Broker leg closed first. Prop leg closed immediately to keep the pair synchronized."
+        : "Both legs were already closed. Trade pair finalized from runtime sync.";
+
+  return {
+    type: "FORCED_CLOSE" as const,
+    message: sourceMessage,
+    riskEventType: "FORCED_CLOSE" as const,
+  };
 }
 
 async function persistRuntimeMetrics(params: {
@@ -455,9 +529,19 @@ async function finalizeTriggeredExit(
 }
 
 async function monitorSlot(row: WatchedSlotRow) {
-  const [propMetrics, brokerMetrics] = await Promise.all([
+  const [propMetrics, brokerMetrics, propPositions, brokerPositions] = await Promise.all([
     getMetaApiAccountLiveMetrics(row.prop_metaapi_account_id!),
     getMetaApiAccountLiveMetrics(row.broker_metaapi_account_id!),
+    row.trade_pair_id
+      ? getMetaApiOpenPositions(row.prop_metaapi_account_id!, {
+          symbol: row.symbol ?? "XAUUSD",
+        })
+      : Promise.resolve([]),
+    row.trade_pair_id
+      ? getMetaApiOpenPositions(row.broker_metaapi_account_id!, {
+          symbol: row.symbol ?? "XAUUSD",
+        })
+      : Promise.resolve([]),
   ]);
 
   await persistRuntimeMetrics({
@@ -470,6 +554,47 @@ async function monitorSlot(row: WatchedSlotRow) {
   });
 
   if (!row.trade_pair_id) {
+    return;
+  }
+
+  if (isSyntheticTradePair(row)) {
+    return;
+  }
+
+  const propLegOpen = propPositions.length > 0;
+  const brokerLegOpen = brokerPositions.length > 0;
+
+  if (!propLegOpen || !brokerLegOpen) {
+    if (propLegOpen) {
+      await closeMetaApiPositions(row.prop_metaapi_account_id!, {
+        symbol: row.symbol ?? "XAUUSD",
+      });
+    }
+
+    if (brokerLegOpen) {
+      await closeMetaApiPositions(row.broker_metaapi_account_id!, {
+        symbol: row.symbol ?? "XAUUSD",
+      });
+    }
+
+    const syncDecision = buildPostCloseSyncDecision({
+      challenge: row.challenge,
+      phase: row.phase,
+      riskPerTrade: Number(row.risk_per_trade ?? 1.5),
+      propEquity: propMetrics.equity,
+      source:
+        !propLegOpen && brokerLegOpen
+          ? "PROP_CLOSED"
+          : propLegOpen && !brokerLegOpen
+            ? "BROKER_CLOSED"
+            : "BOTH_CLOSED",
+    });
+
+    await finalizeTriggeredExit(row, syncDecision, propMetrics, brokerMetrics);
+    return;
+  }
+
+  if (row.runtime_status !== "RUNNING") {
     return;
   }
 
@@ -524,7 +649,7 @@ export function startEquityWatcher(intervalMs: number) {
   void tickEquityWatcher();
   watcherTimer = setInterval(() => {
     void tickEquityWatcher();
-  }, Math.max(intervalMs, 3000));
+  }, Math.max(intervalMs, 1000));
 }
 
 export function stopEquityWatcher() {

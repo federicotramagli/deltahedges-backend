@@ -1,6 +1,7 @@
 import { Router } from "express";
 import {
   calculateBrokerLot,
+  getChallengeAccountSize,
   getEffectiveMultiplier,
   type ChallengeName,
 } from "@deltahedge/shared";
@@ -16,6 +17,7 @@ import {
 } from "../services/metaapi-service.js";
 import {
   closeOpenTradePairForSlot,
+  getSlotById,
   getOpenTradePairForSlot,
   getStoredSlotAccounts,
   recordOpenedTradePair,
@@ -171,6 +173,29 @@ function assertAccountConnected(
   throw new Error(
     `${side} not connected: MetaApi account ${snapshot.accountId} is ${snapshot.connectionStatus} (${snapshot.deploymentState})`,
   );
+}
+
+function buildPropProtectionLevels(params: {
+  challenge: ChallengeName;
+  phase: "Fase 1" | "Fase 2" | "Funded";
+  riskPerTrade: number;
+}) {
+  const startingBalance = getChallengeAccountSize(params.challenge);
+  const stopLossCurrency = Number(
+    (startingBalance * (params.riskPerTrade / 100)).toFixed(2),
+  );
+  const takeProfitCurrency =
+    params.phase === "Fase 1"
+      ? Number((startingBalance * 0.08).toFixed(2))
+      : params.phase === "Fase 2"
+        ? Number((startingBalance * 0.05).toFixed(2))
+        : null;
+
+  return {
+    startingBalance,
+    stopLossCurrency,
+    takeProfitCurrency,
+  };
 }
 
 async function tryOrphanAbort(input: {
@@ -390,6 +415,13 @@ debugRouter.post("/test-execution", async (request, response, next) => {
   const propDirection = parsed.direction;
   const brokerDirection = propDirection === "BUY" ? "SELL" : "BUY";
   const symbol = parsed.symbol.trim().toUpperCase();
+  const slotSnapshot = await getSlotById(authedRequest.auth.userId, parsed.slotId).catch(() => null);
+  const riskPerTrade = slotSnapshot?.riskPerTrade ?? 1.5;
+  const propProtection = buildPropProtectionLevels({
+    challenge: parsed.challenge,
+    phase: parsed.phase,
+    riskPerTrade,
+  });
 
   void (async () => {
     const [propSnapshot, brokerSnapshot] = await Promise.all([
@@ -411,6 +443,12 @@ debugRouter.post("/test-execution", async (request, response, next) => {
           symbol,
           direction: propDirection,
           volume: propLot,
+          stopLoss: propProtection.stopLossCurrency,
+          stopLossUnits: "RELATIVE_CURRENCY",
+          takeProfit: propProtection.takeProfitCurrency,
+          takeProfitUnits: propProtection.takeProfitCurrency
+            ? "RELATIVE_CURRENCY"
+            : null,
         }),
       ),
       withStage("broker trade", () =>
@@ -462,6 +500,8 @@ debugRouter.post("/test-execution", async (request, response, next) => {
         brokerDirection,
         propLot,
         brokerLot: brokerLot.rounded,
+        propStopLossCurrency: propProtection.stopLossCurrency,
+        propTakeProfitCurrency: propProtection.takeProfitCurrency,
         propTrade: propTradeResult.value,
         brokerTrade: brokerTradeResult.value,
       });

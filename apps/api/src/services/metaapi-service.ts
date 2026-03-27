@@ -98,6 +98,10 @@ export interface SubmitMetaApiTradeInput {
   symbol: string;
   direction: "BUY" | "SELL";
   volume: number;
+  stopLoss?: number | null;
+  stopLossUnits?: "RELATIVE_CURRENCY" | null;
+  takeProfit?: number | null;
+  takeProfitUnits?: "RELATIVE_CURRENCY" | null;
   comment?: string;
   retries?: number;
   delayMs?: number;
@@ -841,6 +845,16 @@ export async function submitMetaApiTrade(
       symbol: input.symbol,
       volume: Number(input.volume.toFixed(2)),
     };
+
+    if (input.stopLoss !== undefined && input.stopLoss !== null) {
+      requestBody.stopLoss = Number(input.stopLoss.toFixed(2));
+      requestBody.stopLossUnits = input.stopLossUnits ?? "RELATIVE_CURRENCY";
+    }
+
+    if (input.takeProfit !== undefined && input.takeProfit !== null) {
+      requestBody.takeProfit = Number(input.takeProfit.toFixed(2));
+      requestBody.takeProfitUnits = input.takeProfitUnits ?? "RELATIVE_CURRENCY";
+    }
 
     if (input.comment && input.comment.trim().length > 0) {
       requestBody.comment = input.comment.trim();
