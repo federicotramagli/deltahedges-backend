@@ -11,7 +11,7 @@ const server = createServer(app);
 
 attachRuntimeGateway(server);
 
-server.listen(config.API_PORT, () => {
+server.listen(config.API_PORT, "0.0.0.0", () => {
   logger.info({ port: config.API_PORT }, "DeltaHedge API listening");
 });
 

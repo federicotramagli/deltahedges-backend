@@ -38,6 +38,9 @@ export function createApp() {
   app.use("/stripe", stripeWebhookRouter);
   app.use(express.json());
 
+  app.get("/", (_request, response) => {
+    response.json({ ok: true, service: "deltahedge-api", path: "/" });
+  });
   app.use("/health", healthRouter);
   app.use("/debug", debugRouter);
   app.use("/accounts-library", accountsLibraryRouter);
