@@ -981,7 +981,24 @@ export async function provisionMetaApiAccount(
     if (reusableAccount?._id || reusableAccount?.id) {
       accountId = reusableAccount._id ?? reusableAccount.id ?? null;
       if (accountId) {
-        await updateMetaApiAccount(accountId, input);
+        try {
+          await updateMetaApiAccount(accountId, input);
+        } catch (error) {
+          if (!isMetaApiNotFoundError(error)) {
+            throw error;
+          }
+
+          logger.warn(
+            {
+              slotId: input.slotId,
+              accountType: input.accountType,
+              accountId,
+            },
+            "MetaApi reusable account not found, creating a new one",
+          );
+
+          accountId = null;
+        }
       }
     }
 
