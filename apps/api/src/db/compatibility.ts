@@ -74,6 +74,40 @@ export async function ensureDatabaseCompatibility() {
     `);
 
     await pool.query(`
+      create table if not exists metaapi_account_registry (
+        id uuid primary key default gen_random_uuid(),
+        credential_fingerprint text not null unique,
+        platform text not null default 'mt5',
+        login_ciphertext text not null,
+        server_ciphertext text not null,
+        password_fingerprint text,
+        metaapi_account_id text,
+        last_connection_status text,
+        last_deployment_state text,
+        last_validated_at timestamptz,
+        created_at timestamptz not null default now(),
+        updated_at timestamptz not null default now()
+      )
+    `);
+
+    await pool.query(`
+      alter table if exists metaapi_account_registry
+        add column if not exists platform text not null default 'mt5',
+        add column if not exists login_ciphertext text,
+        add column if not exists server_ciphertext text,
+        add column if not exists password_fingerprint text,
+        add column if not exists metaapi_account_id text,
+        add column if not exists last_connection_status text,
+        add column if not exists last_deployment_state text,
+        add column if not exists last_validated_at timestamptz
+    `);
+
+    await pool.query(`
+      create unique index if not exists metaapi_account_registry_fingerprint_idx
+        on metaapi_account_registry(credential_fingerprint)
+    `);
+
+    await pool.query(`
       create unique index if not exists saved_accounts_user_label_type_idx
         on saved_accounts(user_id, label, account_type)
     `);

@@ -11,6 +11,7 @@ import {
   waitUntilMetaApiAccountConnected,
 } from "./metaapi-service.js";
 import { assertAvailableSeatForUser } from "./seat-service.js";
+import { refreshTradingAccountConnectionsForUser } from "./trading-account-connection-service.js";
 
 type SavedAccountConnectionState = "pending" | "connected" | "error";
 
@@ -112,6 +113,13 @@ function isMetaApiConnectionFailureStatus(status: string | null | undefined) {
 function shouldRefreshPendingSavedAccount(row: SavedAccountRow) {
   if (row.deleted_at) return false;
   return row.connection_state === "pending";
+}
+
+function isSavedAccountPendingTooLong(row: SavedAccountRow, thresholdMs = 90_000) {
+  const reference = row.last_validated_at ?? row.created_at;
+  const timestamp = Date.parse(reference ?? "");
+  if (!Number.isFinite(timestamp)) return false;
+  return Date.now() - timestamp >= thresholdMs;
 }
 
 async function findMatchingSavedAccountRow(
@@ -395,11 +403,18 @@ async function validateSavedAccountConnection(
       }
     }
 
+    const snapshotStatus = snapshot?.connectionStatus ?? null;
+    const isHardFailure =
+      isMetaApiConnectionFailureStatus(snapshotStatus) ||
+      /invalid|wrong|incorrect|not found|failed/i.test(message);
+
     return {
       metaApiAccountId: snapshot?.accountId ?? provisionedAccountId ?? null,
-      connectionState: "error",
-      validationMessage: message,
-      connectionStatus: snapshot?.connectionStatus ?? null,
+      connectionState: isHardFailure ? "error" : "pending",
+      validationMessage: isHardFailure
+        ? message
+        : "Connessione MetaApi in corso...",
+      connectionStatus: snapshotStatus,
       balance: null,
       equity: null,
       lastValidatedAt,
@@ -430,7 +445,22 @@ async function refreshSavedAccountConnection(
 
   if (row.metaapi_account_id) {
     try {
-      const snapshot = await getMetaApiAccountConnectionSnapshot(row.metaapi_account_id);
+      let snapshot = await getMetaApiAccountConnectionSnapshot(row.metaapi_account_id);
+
+      if (
+        snapshot.connectionStatus !== "CONNECTED" &&
+        !isMetaApiConnectionFailureStatus(snapshot.connectionStatus)
+      ) {
+        try {
+          await waitUntilMetaApiAccountConnected(row.metaapi_account_id, {
+            retries: 6,
+            delayMs: 1500,
+          });
+          snapshot = await getMetaApiAccountConnectionSnapshot(row.metaapi_account_id);
+        } catch {
+          // Keep the latest snapshot and let the stale timeout decide if this becomes an error.
+        }
+      }
 
       if (snapshot.connectionStatus === "CONNECTED") {
         const metrics = await getMetaApiAccountLiveMetrics(row.metaapi_account_id);
@@ -469,8 +499,10 @@ async function refreshSavedAccountConnection(
         preserveExistingLabel: true,
         validation: {
           metaApiAccountId: row.metaapi_account_id,
-          connectionState: "pending",
-          validationMessage: "Connessione MetaApi in corso...",
+          connectionState: isSavedAccountPendingTooLong(row) ? "error" : "pending",
+          validationMessage: isSavedAccountPendingTooLong(row)
+            ? "MetaApi non riesce a stabilizzare la connessione. Controlla login, password e server."
+            : "Connessione MetaApi in corso...",
           connectionStatus: snapshot.connectionStatus,
           balance: null,
           equity: null,
@@ -500,6 +532,8 @@ async function refreshSavedAccountConnection(
 export async function listSavedAccountsForUser(userId: string) {
   const client = await pool.connect();
   try {
+    await refreshTradingAccountConnectionsForUser(client, userId);
+
     const backfillResult = await client.query<TradingAccountBackfillRow>(
       `
         select

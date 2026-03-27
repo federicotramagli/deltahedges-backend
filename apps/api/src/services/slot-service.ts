@@ -12,8 +12,6 @@ import { adminEmails } from "../config.js";
 import { pool } from "../db/pool.js";
 import { decryptSecret, encryptSecret } from "./crypto-service.js";
 import {
-  ensureSingleMetaApiAccount,
-  getMetaApiAccountConnectionSnapshot,
   getMetaApiAccountLiveMetrics,
   provisionMetaApiAccount,
 } from "./metaapi-service.js";
@@ -24,6 +22,7 @@ import {
   getSeatAvailabilityForUser,
   releaseSeatForSlot,
 } from "./seat-service.js";
+import { refreshTradingAccountConnectionsForUser } from "./trading-account-connection-service.js";
 import {
   getSavedAccountForImport,
   upsertSavedAccountForUser,
@@ -101,13 +100,6 @@ type ReusableTradingAccountRow = {
   server_ciphertext: string | null;
 };
 
-type RefreshableTradingAccountRow = {
-  id: string;
-  slot_id: string;
-  account_type: "PROP" | "BROKER";
-  metaapi_account_id: string;
-};
-
 type SlotParametersRuntimeRow = {
   challenge: ChallengeName;
   phase: "Fase 1" | "Fase 2" | "Funded";
@@ -122,26 +114,14 @@ function sameEncryptedSecret(ciphertext: string | null, plain: string) {
 }
 
 async function reuseOrProvisionMetaAccount(
-  mode: "reuse" | "provision",
+  _mode: "reuse" | "provision",
   input: Parameters<typeof provisionMetaApiAccount>[0],
   existingAccountId?: string | null,
 ) {
-  if (mode === "reuse" && existingAccountId) {
-    try {
-      const snapshot = await getMetaApiAccountConnectionSnapshot(existingAccountId);
-      await ensureSingleMetaApiAccount(input, snapshot.accountId);
-      return {
-        accountId: snapshot.accountId,
-        deploymentState:
-          snapshot.deploymentState === "UNKNOWN" ? "NOT_DEPLOYED" : snapshot.deploymentState,
-        connectionStatus: snapshot.connectionStatus,
-      };
-    } catch {
-      // If the stored id is stale, recreate/update once.
-    }
-  }
-
-  return provisionMetaApiAccount(input);
+  return provisionMetaApiAccount({
+    ...input,
+    existingAccountId: existingAccountId ?? input.existingAccountId ?? null,
+  });
 }
 
 async function findReusableTradingAccountForUser(
@@ -182,69 +162,6 @@ async function findReusableTradingAccountForUser(
       );
     }) ?? null
   );
-}
-
-async function refreshTradingAccountConnectionsForUser(
-  client: PoolClient,
-  userId: string,
-) {
-  const result = await client.query<RefreshableTradingAccountRow>(
-    `
-      select id, slot_id, account_type, metaapi_account_id
-      from trading_accounts
-      where user_id = $1
-        and metaapi_account_id is not null
-    `,
-    [userId],
-  );
-
-  for (const row of result.rows) {
-    try {
-      const snapshot = await getMetaApiAccountConnectionSnapshot(row.metaapi_account_id);
-      const metrics =
-        snapshot.connectionStatus === "CONNECTED"
-          ? await getMetaApiAccountLiveMetrics(row.metaapi_account_id).catch(() => null)
-          : null;
-
-      await client.query(
-        `
-          update trading_accounts
-          set
-            deployment_state = $2,
-            connection_status = $3,
-            updated_at = now()
-          where id = $1
-        `,
-        [
-          row.id,
-          snapshot.deploymentState === "UNKNOWN"
-            ? "NOT_DEPLOYED"
-            : snapshot.deploymentState,
-          metrics?.connectionStatus ?? snapshot.connectionStatus,
-        ],
-      );
-
-      if (metrics && metrics.connectionStatus === "CONNECTED") {
-        await client.query(
-          `
-            insert into slot_runtime (slot_id, prop_equity, broker_equity)
-            values (
-              $1,
-              case when $2 = 'PROP' then $3 else null end,
-              case when $2 = 'BROKER' then $3 else null end
-            )
-            on conflict (slot_id)
-            do update set
-              prop_equity = case when $2 = 'PROP' then $3 else slot_runtime.prop_equity end,
-              broker_equity = case when $2 = 'BROKER' then $3 else slot_runtime.broker_equity end
-          `,
-          [row.slot_id, row.account_type, metrics.equity],
-        );
-      }
-    } catch {
-      // Ignore refresh failures here and keep the last known snapshot.
-    }
-  }
 }
 
 function maskLogin(login: string) {

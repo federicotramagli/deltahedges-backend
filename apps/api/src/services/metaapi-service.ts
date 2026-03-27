@@ -1,6 +1,8 @@
 import crypto from "node:crypto";
 import { config } from "../config.js";
+import { pool } from "../db/pool.js";
 import { logger } from "../logger.js";
+import { encryptSecret } from "./crypto-service.js";
 
 const METAAPI_PROVISIONING_BASE_URL =
   "https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai";
@@ -37,6 +39,18 @@ interface MetaApiAccountDto {
   connectionStatus?: MetaApiConnectionStatus;
   region?: string;
 }
+
+type MetaApiRegistryRow = {
+  credential_fingerprint: string;
+  platform: "mt4" | "mt5";
+  login_ciphertext: string;
+  server_ciphertext: string;
+  password_fingerprint: string | null;
+  metaapi_account_id: string | null;
+  last_connection_status: string | null;
+  last_deployment_state: string | null;
+  last_validated_at: string | null;
+};
 
 export interface MetaApiAccountConnectionSnapshot {
   accountId: string;
@@ -164,22 +178,51 @@ function createTransactionId() {
   return crypto.randomBytes(16).toString("hex");
 }
 
-function buildMetaApiAccountName(
-  slotId: string,
-  accountType: "PROP" | "BROKER",
-) {
-  const suffix = crypto
-    .createHash("sha1")
-    .update(`${slotId}:${accountType}`)
-    .digest("hex")
-    .slice(0, 8);
-  return `DeltaHedge ${accountType} ${suffix}`;
+function normalizeMetaApiIdentity(input: ProvisionMetaApiAccountInput) {
+  return {
+    platform: (input.platform ?? config.METAAPI_DEFAULT_PLATFORM) as "mt4" | "mt5",
+    login: String(input.login ?? "").trim(),
+    password: String(input.password ?? "").trim(),
+    server: String(input.server ?? "").trim(),
+  };
 }
 
-function createMagicNumber(slotId: string, accountType: "PROP" | "BROKER") {
+function buildMetaApiCredentialFingerprint(input: ProvisionMetaApiAccountInput) {
+  const normalized = normalizeMetaApiIdentity(input);
+  return crypto
+    .createHash("sha256")
+    .update(
+      `${normalized.platform.toLowerCase()}|${normalized.login.toLowerCase()}|${normalized.server.toLowerCase()}`,
+    )
+    .digest("hex");
+}
+
+function buildMetaApiPasswordFingerprint(input: ProvisionMetaApiAccountInput) {
+  const normalized = normalizeMetaApiIdentity(input);
+  return crypto
+    .createHash("sha256")
+    .update(normalized.password)
+    .digest("hex");
+}
+
+function buildMetaApiAccountName(input: ProvisionMetaApiAccountInput) {
+  const normalized = normalizeMetaApiIdentity(input);
+  const loginPart = normalized.login.replace(/[^a-z0-9]/gi, "").slice(0, 12) || "account";
+  const serverPart = crypto
+    .createHash("sha1")
+    .update(normalized.server.toLowerCase())
+    .digest("hex")
+    .slice(0, 8);
+  return `DeltaHedge ${normalized.platform.toUpperCase()} ${loginPart} ${serverPart}`;
+}
+
+function createMagicNumber(input: ProvisionMetaApiAccountInput) {
+  const normalized = normalizeMetaApiIdentity(input);
   const base = crypto
     .createHash("sha1")
-    .update(`${slotId}:${accountType}`)
+    .update(
+      `${normalized.platform.toLowerCase()}:${normalized.login.toLowerCase()}:${normalized.server.toLowerCase()}`,
+    )
     .digest()
     .readUInt32BE(0);
   return (base % 900000) + 100000;
@@ -299,18 +342,128 @@ function isMetaApiNotFoundError(error: unknown) {
   return /not found/i.test(message);
 }
 
+function isMetaApiConnectionFailureStatus(status: string | null | undefined) {
+  return (
+    status === "ACCOUNT_FAILED" ||
+    status === "BROKER_CONNECTION_FAILED" ||
+    status === "DISCONNECTED_FROM_BROKER"
+  );
+}
+
 function toNullableMoney(value: unknown) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) return null;
   return Number(numeric.toFixed(2));
 }
 
+async function readMetaApiRegistryRow(
+  input: ProvisionMetaApiAccountInput,
+): Promise<MetaApiRegistryRow | null> {
+  const result = await pool.query<MetaApiRegistryRow>(
+    `
+      select
+        credential_fingerprint,
+        platform,
+        login_ciphertext,
+        server_ciphertext,
+        password_fingerprint,
+        metaapi_account_id,
+        last_connection_status,
+        last_deployment_state,
+        last_validated_at::text
+      from metaapi_account_registry
+      where credential_fingerprint = $1
+      limit 1
+    `,
+    [buildMetaApiCredentialFingerprint(input)],
+  );
+
+  return result.rows[0] ?? null;
+}
+
+async function upsertMetaApiRegistryRow(
+  input: ProvisionMetaApiAccountInput,
+  values: {
+    metaApiAccountId: string | null;
+    connectionStatus?: string | null;
+    deploymentState?: string | null;
+  },
+) {
+  const normalized = normalizeMetaApiIdentity(input);
+  await pool.query(
+    `
+      insert into metaapi_account_registry (
+        credential_fingerprint,
+        platform,
+        login_ciphertext,
+        server_ciphertext,
+        password_fingerprint,
+        metaapi_account_id,
+        last_connection_status,
+        last_deployment_state,
+        last_validated_at,
+        updated_at
+      )
+      values ($1, $2, $3, $4, $5, $6, $7, $8, now(), now())
+      on conflict (credential_fingerprint)
+      do update set
+        platform = excluded.platform,
+        login_ciphertext = excluded.login_ciphertext,
+        server_ciphertext = excluded.server_ciphertext,
+        password_fingerprint = excluded.password_fingerprint,
+        metaapi_account_id = excluded.metaapi_account_id,
+        last_connection_status = excluded.last_connection_status,
+        last_deployment_state = excluded.last_deployment_state,
+        last_validated_at = now(),
+        updated_at = now()
+    `,
+    [
+      buildMetaApiCredentialFingerprint(input),
+      normalized.platform,
+      encryptSecret(normalized.login),
+      encryptSecret(normalized.server),
+      buildMetaApiPasswordFingerprint(input),
+      values.metaApiAccountId,
+      values.connectionStatus ?? null,
+      values.deploymentState ?? null,
+    ],
+  );
+}
+
+function shouldUpdateMetaApiCredentials(
+  registryRow: MetaApiRegistryRow | null,
+  input: ProvisionMetaApiAccountInput,
+) {
+  if (!registryRow) return false;
+  return registryRow.password_fingerprint !== buildMetaApiPasswordFingerprint(input);
+}
+
+function shouldRedeployMetaApiAccount(snapshot: MetaApiAccountConnectionSnapshot) {
+  return (
+    snapshot.deploymentState === "UNKNOWN" ||
+    snapshot.deploymentState === "CREATED" ||
+    snapshot.deploymentState === "UNDEPLOYED" ||
+    snapshot.deploymentState === "DELETE_FAILED" ||
+    snapshot.deploymentState === "DEPLOY_FAILED" ||
+    snapshot.deploymentState === "REDEPLOY_FAILED"
+  );
+}
+
+function shouldRepairMetaApiAccountWithoutRegistry(
+  snapshot: MetaApiAccountConnectionSnapshot,
+) {
+  return (
+    isMetaApiConnectionFailureStatus(snapshot.connectionStatus) ||
+    shouldRedeployMetaApiAccount(snapshot)
+  );
+}
+
 function buildMetaApiCreateAccountPayload(input: ProvisionMetaApiAccountInput) {
   const payload: Record<string, unknown> = {
-    name: buildMetaApiAccountName(input.slotId, input.accountType),
+    name: buildMetaApiAccountName(input),
     server: input.server,
     password: input.password,
-    magic: createMagicNumber(input.slotId, input.accountType),
+    magic: createMagicNumber(input),
     region: config.METAAPI_REGION,
     type: "cloud-g2",
   };
@@ -324,10 +477,10 @@ function buildMetaApiCreateAccountPayload(input: ProvisionMetaApiAccountInput) {
 
 function buildMetaApiUpdateAccountPayload(input: ProvisionMetaApiAccountInput) {
   const payload: Record<string, unknown> = {
-    name: buildMetaApiAccountName(input.slotId, input.accountType),
+    name: buildMetaApiAccountName(input),
     server: input.server,
     password: input.password,
-    magic: createMagicNumber(input.slotId, input.accountType),
+    magic: createMagicNumber(input),
   };
 
   if (config.METAAPI_ALLOCATE_DEDICATED_IP) {
@@ -439,6 +592,7 @@ async function findReusableMetaApiAccount(
 ): Promise<MetaApiAccountDto | null> {
   const accounts = await listMetaApiAccounts();
   const expectedVersion = input.platform === "mt4" ? 4 : 5;
+  const stableName = buildMetaApiAccountName(input);
 
   const matches = accounts.filter((account) => {
     const accountId = account._id ?? account.id;
@@ -447,8 +601,7 @@ async function findReusableMetaApiAccount(
     return (
       String(account.login ?? "") === String(input.login) &&
       String(account.server ?? "") === String(input.server) &&
-      Number(account.version ?? 0) === expectedVersion &&
-      String(account.name ?? "").startsWith(`DeltaHedge ${input.accountType}`)
+      Number(account.version ?? 0) === expectedVersion
     );
   });
 
@@ -457,6 +610,12 @@ async function findReusableMetaApiAccount(
   }
 
   matches.sort((left, right) => {
+    const leftStable = String(left.name ?? "") === stableName ? 1 : 0;
+    const rightStable = String(right.name ?? "") === stableName ? 1 : 0;
+    if (leftStable !== rightStable) {
+      return rightStable - leftStable;
+    }
+
     const leftConnected = left.connectionStatus === "CONNECTED" ? 1 : 0;
     const rightConnected = right.connectionStatus === "CONNECTED" ? 1 : 0;
     if (leftConnected !== rightConnected) {
@@ -491,8 +650,7 @@ async function cleanupDuplicateMetaApiAccounts(
     return (
       String(account.login ?? "") === String(input.login) &&
       String(account.server ?? "") === String(input.server) &&
-      Number(account.version ?? 0) === expectedVersion &&
-      String(account.name ?? "").startsWith(`DeltaHedge ${input.accountType}`)
+      Number(account.version ?? 0) === expectedVersion
     );
   });
 
@@ -954,11 +1112,34 @@ export async function provisionMetaApiAccount(
     };
   }
 
-  let accountId = input.existingAccountId ?? null;
+  const registryRow = await readMetaApiRegistryRow(input);
+  let accountId =
+    input.existingAccountId ??
+    registryRow?.metaapi_account_id ??
+    null;
+
+  const reuseExistingAccount = async (candidateAccountId: string) => {
+    const snapshot = await getMetaApiAccountConnectionSnapshot(candidateAccountId);
+    const shouldUpdateCredentials =
+      shouldUpdateMetaApiCredentials(registryRow, input) ||
+      (!registryRow && shouldRepairMetaApiAccountWithoutRegistry(snapshot));
+
+    if (shouldUpdateCredentials) {
+      await updateMetaApiAccount(candidateAccountId, input);
+      return readMetaApiAccount(candidateAccountId);
+    }
+
+    if (shouldRedeployMetaApiAccount(snapshot)) {
+      await deployMetaApiAccount(candidateAccountId);
+      return readMetaApiAccount(candidateAccountId);
+    }
+
+    return readMetaApiAccount(candidateAccountId);
+  };
 
   if (accountId) {
     try {
-      await updateMetaApiAccount(accountId, input);
+      await reuseExistingAccount(accountId);
     } catch (error) {
       if (!isMetaApiNotFoundError(error)) {
         throw error;
@@ -970,42 +1151,43 @@ export async function provisionMetaApiAccount(
           accountType: input.accountType,
           accountId,
         },
-        "MetaApi existing account not found, creating a new one",
+        "MetaApi referenced account not found, searching reusable account",
       );
 
-      accountId = await createMetaApiAccount(input);
-      await deployMetaApiAccount(accountId);
+      accountId = null;
     }
-  } else {
+  }
+
+  if (!accountId) {
     const reusableAccount = await findReusableMetaApiAccount(input);
-    if (reusableAccount?._id || reusableAccount?.id) {
-      accountId = reusableAccount._id ?? reusableAccount.id ?? null;
-      if (accountId) {
-        try {
-          await updateMetaApiAccount(accountId, input);
-        } catch (error) {
-          if (!isMetaApiNotFoundError(error)) {
-            throw error;
-          }
+    const reusableAccountId = reusableAccount?._id ?? reusableAccount?.id ?? null;
 
-          logger.warn(
-            {
-              slotId: input.slotId,
-              accountType: input.accountType,
-              accountId,
-            },
-            "MetaApi reusable account not found, creating a new one",
-          );
-
-          accountId = null;
+    if (reusableAccountId) {
+      accountId = reusableAccountId;
+      try {
+        await reuseExistingAccount(accountId);
+      } catch (error) {
+        if (!isMetaApiNotFoundError(error)) {
+          throw error;
         }
+
+        logger.warn(
+          {
+            slotId: input.slotId,
+            accountType: input.accountType,
+            accountId,
+          },
+          "MetaApi reusable account disappeared, creating a new one",
+        );
+
+        accountId = null;
       }
     }
+  }
 
-    if (!accountId) {
-      accountId = await createMetaApiAccount(input);
-      await deployMetaApiAccount(accountId);
-    }
+  if (!accountId) {
+    accountId = await createMetaApiAccount(input);
+    await deployMetaApiAccount(accountId);
   }
 
   const account = await readMetaApiAccount(accountId);
@@ -1024,6 +1206,12 @@ export async function provisionMetaApiAccount(
     },
     "MetaApi account provisioned",
   );
+
+  await upsertMetaApiRegistryRow(input, {
+    metaApiAccountId: accountId,
+    connectionStatus,
+    deploymentState,
+  });
 
   await cleanupDuplicateMetaApiAccounts(input, accountId);
 
