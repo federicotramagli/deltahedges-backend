@@ -13,8 +13,8 @@ export const connection = {
 };
 
 export const queues = {
-  dailyPlanner: new Queue("deltahedge:daily-planner", { connection }),
-  slotEntry: new Queue("deltahedge:slot-entry", { connection }),
-  slotForcedClose: new Queue("deltahedge:slot-forced-close", { connection }),
-  slotMonitor: new Queue("deltahedge:slot-monitor", { connection }),
+  dailyPlanner: new Queue("deltahedge-daily-planner", { connection }),
+  slotEntry: new Queue("deltahedge-slot-entry", { connection }),
+  slotForcedClose: new Queue("deltahedge-slot-forced-close", { connection }),
+  slotMonitor: new Queue("deltahedge-slot-monitor", { connection }),
 };
