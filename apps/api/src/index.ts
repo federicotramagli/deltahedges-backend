@@ -11,11 +11,11 @@ const server = createServer(app);
 
 attachRuntimeGateway(server);
 
-await ensureDatabaseCompatibility();
-
 server.listen(config.API_PORT, () => {
   logger.info({ port: config.API_PORT }, "DeltaHedge API listening");
 });
+
+void ensureDatabaseCompatibility();
 
 process.on("SIGINT", async () => {
   await pool.end();
