@@ -198,11 +198,6 @@ async function tryOrphanAbort(input: {
 }
 
 debugRouter.post("/connection-status", async (request, response, next) => {
-  if (config.NODE_ENV === "production") {
-    response.status(404).json({ error: "Not found" });
-    return;
-  }
-
   const authedRequest = request as AuthedRequest;
   const parsed = debugConnectionStatusSchema.parse(request.body);
 
@@ -248,11 +243,6 @@ debugRouter.post("/connection-status", async (request, response, next) => {
 });
 
 debugRouter.post("/live-metrics", async (request, response, next) => {
-  if (config.NODE_ENV === "production") {
-    response.status(404).json({ error: "Not found" });
-    return;
-  }
-
   const authedRequest = request as AuthedRequest;
   const parsed = debugConnectionStatusSchema.parse(request.body);
 

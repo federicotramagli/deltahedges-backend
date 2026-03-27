@@ -292,10 +292,20 @@ async function getBillingCountry(client: PoolClient, userId: string) {
   const result = await client.query<{ billing_country: string | null }>(
     `
       select billing_country
-      from subscriptions
-      where user_id = $1
-        and status = 'ACTIVE'
-      order by updated_at desc
+      from (
+        select billing_country, updated_at
+        from subscriptions
+        where user_id = $1
+          and status = 'ACTIVE'
+
+        union all
+
+        select billing_country, updated_at
+        from user_profiles
+        where user_id = $1
+      ) sources
+      where billing_country is not null
+      order by updated_at desc nulls last
       limit 1
     `,
     [userId],
@@ -501,6 +511,16 @@ export async function createSlot(
     return slot;
   } catch (error) {
     await client.query("rollback");
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      "constraint" in error &&
+      (error as { code?: string }).code === "23505" &&
+      (error as { constraint?: string }).constraint === "hedging_slots_user_slot_name_idx"
+    ) {
+      throw new Error("Esiste gia uno slot con questo nome. Scegli un nome diverso.");
+    }
     throw error;
   } finally {
     client.release();
@@ -534,9 +554,6 @@ export async function upsertSlotAccounts(
   try {
     await client.query("begin");
     const billingCountry = await getBillingCountry(client, userId);
-    if (!billingCountry) {
-      throw new Error("Billing country missing. Complete Stripe checkout first.");
-    }
 
     const proxy = await assignDedicatedProxyForUser({
       client,

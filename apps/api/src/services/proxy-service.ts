@@ -10,7 +10,7 @@ export interface AssignedProxy {
 export async function assignDedicatedProxyForUser(params: {
   client: PoolClient;
   userId: string;
-  billingCountry: string;
+  billingCountry?: string | null;
 }): Promise<AssignedProxy> {
   const existing = await params.client.query<{
     id: string;
@@ -45,7 +45,10 @@ export async function assignDedicatedProxyForUser(params: {
       select id, ip_address, country_code
       from proxy_pool
       where status = 'AVAILABLE'
-        and upper(country_code) = upper($1)
+        and (
+          $1::text is null
+          or upper(country_code) = upper($1)
+        )
       order by created_at asc
       limit 1
       for update skip locked
@@ -54,7 +57,27 @@ export async function assignDedicatedProxyForUser(params: {
   );
 
   if (!picked.rowCount) {
-    throw new Error(`No dedicated proxy available for ${params.billingCountry}`);
+    const fallback = await params.client.query<{
+      id: string;
+      ip_address: string;
+      country_code: string;
+    }>(
+      `
+        select id, ip_address, country_code
+        from proxy_pool
+        where status = 'AVAILABLE'
+        order by created_at asc
+        limit 1
+        for update skip locked
+      `,
+    );
+
+    if (!fallback.rowCount) {
+      const countryLabel = params.billingCountry || "the selected user";
+      throw new Error(`No dedicated proxy available for ${countryLabel}`);
+    }
+
+    picked.rows.push(fallback.rows[0]!);
   }
 
   const row = picked.rows[0]!;
@@ -80,7 +103,7 @@ export async function assignDedicatedProxyForUser(params: {
                     proxy_id = excluded.proxy_id,
                     updated_at = now()
     `,
-    [params.userId, params.billingCountry, row.id, config.METAAPI_REGION],
+    [params.userId, params.billingCountry ?? row.country_code, row.id, config.METAAPI_REGION],
   );
 
   return {
