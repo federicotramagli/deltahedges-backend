@@ -7,6 +7,10 @@
     "packages/*"
   ],
   "scripts": {
+    "build": "npm run build:api",
+    "start": "node apps/api/dist/index.js",
+    "start:api": "node apps/api/dist/index.js",
+    "start:worker": "node apps/worker/dist/index.js",
     "dev:api": "npm run dev -w @deltahedge/api",
     "dev:worker": "npm run dev -w @deltahedge/worker",
     "build:shared": "npm run build -w @deltahedge/shared",
