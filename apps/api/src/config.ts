@@ -44,6 +44,7 @@ export const allowedFrontendOrigins = Array.from(
     [
       ...config.FRONTEND_ORIGIN.split(",").map((value) => value.trim()).filter(Boolean),
       "https://deltahedges.com",
+      "https://www.deltahedges.com",
       "https://app.deltahedges.com",
       "http://127.0.0.1:4177",
       "http://localhost:4177",
