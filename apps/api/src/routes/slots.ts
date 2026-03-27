@@ -6,6 +6,7 @@ import {
   slotParametersSchema,
 } from "@deltahedge/shared";
 import { requireAuth } from "../auth/supabase-auth.js";
+import { adminEmails } from "../config.js";
 import type { AuthedRequest } from "../types/http.js";
 import {
   activateSlot,
@@ -17,6 +18,7 @@ import {
   upsertSlotAccounts,
   upsertSlotParameters,
 } from "../services/slot-service.js";
+import { deleteSlotForUser } from "../services/resource-delete-service.js";
 
 export const slotsRouter = Router();
 const activeSlotAccountSyncs = new Set<string>();
@@ -110,6 +112,24 @@ slotsRouter.get("/:slotId/trades", (request, response, next) => {
   void listTradesForSlot(authedRequest.auth.userId, authedRequest.params.slotId)
     .then((trades) => {
       response.json({ trades });
+    })
+    .catch(next);
+});
+
+slotsRouter.delete("/:slotId", (request, response, next) => {
+  const authedRequest = request as AuthedRequest<unknown, { slotId: string }>;
+  const normalizedEmail = authedRequest.auth.email?.trim().toLowerCase() ?? "";
+
+  if (!adminEmails.has(normalizedEmail)) {
+    response.status(403).json({
+      error: "Solo l'admin puo eliminare le card slot.",
+    });
+    return;
+  }
+
+  void deleteSlotForUser(authedRequest.auth.userId, authedRequest.params.slotId)
+    .then((deletedSlot) => {
+      response.json({ deletedSlot });
     })
     .catch(next);
 });
