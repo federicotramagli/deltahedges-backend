@@ -6,6 +6,32 @@ export async function ensureDatabaseCompatibility() {
     await pool.query("create extension if not exists pgcrypto");
 
     await pool.query(`
+      do $$
+      begin
+        if exists (select 1 from pg_type where typname = 'cycle_outcome') then
+          if not exists (
+            select 1
+            from pg_enum
+            where enumtypid = 'cycle_outcome'::regtype
+              and enumlabel = 'PASS_FASE_1'
+          ) then
+            alter type cycle_outcome add value 'PASS_FASE_1';
+          end if;
+
+          if not exists (
+            select 1
+            from pg_enum
+            where enumtypid = 'cycle_outcome'::regtype
+              and enumlabel = 'PASS_FASE_2'
+          ) then
+            alter type cycle_outcome add value 'PASS_FASE_2';
+          end if;
+        end if;
+      end
+      $$;
+    `);
+
+    await pool.query(`
       alter table if exists trading_accounts
         add column if not exists platform text not null default 'mt5'
     `);
@@ -22,9 +48,29 @@ export async function ensureDatabaseCompatibility() {
         password_ciphertext text not null,
         server_ciphertext text not null,
         broker_lot_step numeric(12,4) not null default 0.01,
+        metaapi_account_id text,
+        connection_state text not null default 'pending',
+        validation_message text,
+        connection_status text,
+        balance numeric(12,2),
+        equity numeric(12,2),
+        last_validated_at timestamptz,
+        deleted_at timestamptz,
         created_at timestamptz not null default now(),
         updated_at timestamptz not null default now()
       )
+    `);
+
+    await pool.query(`
+      alter table if exists saved_accounts
+        add column if not exists metaapi_account_id text,
+        add column if not exists connection_state text not null default 'pending',
+        add column if not exists validation_message text,
+        add column if not exists connection_status text,
+        add column if not exists balance numeric(12,2),
+        add column if not exists equity numeric(12,2),
+        add column if not exists last_validated_at timestamptz,
+        add column if not exists deleted_at timestamptz
     `);
 
     await pool.query(`

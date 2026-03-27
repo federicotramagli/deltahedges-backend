@@ -1,4 +1,5 @@
 import { pool } from "../db/pool.js";
+import { getMetaApiOpenPositions } from "./metaapi-service.js";
 
 type SavedAccountRow = {
   id: string;
@@ -10,6 +11,11 @@ type SlotRow = {
   slot_name: string;
 };
 
+type SlotAccountRow = {
+  account_type: "PROP" | "BROKER";
+  metaapi_account_id: string | null;
+};
+
 export async function deleteSavedAccountForUser(userId: string, accountId: string) {
   const client = await pool.connect();
   try {
@@ -19,7 +25,7 @@ export async function deleteSavedAccountForUser(userId: string, accountId: strin
       `
         select id, label
         from saved_accounts
-        where id = $1 and user_id = $2
+        where id = $1 and user_id = $2 and deleted_at is null
         limit 1
       `,
       [accountId, userId],
@@ -33,7 +39,11 @@ export async function deleteSavedAccountForUser(userId: string, accountId: strin
 
     await client.query(
       `
-        delete from saved_accounts
+        update saved_accounts
+        set
+          label = concat(label, ' [deleted ', substr(id::text, 1, 8), ']'),
+          deleted_at = now(),
+          updated_at = now()
         where id = $1 and user_id = $2
       `,
       [accountId, userId],
@@ -72,9 +82,9 @@ export async function deleteSlotForUser(userId: string, slotId: string) {
       throw new Error("Slot not found");
     }
 
-    const openTradePairResult = await client.query<{ id: string }>(
+    const openTradePairResult = await client.query<{ id: string; symbol: string | null }>(
       `
-        select id
+        select id, symbol
         from trade_pairs
         where slot_id = $1
           and user_id = $2
@@ -85,9 +95,31 @@ export async function deleteSlotForUser(userId: string, slotId: string) {
     );
 
     if (openTradePairResult.rowCount) {
-      throw new Error(
-        "Questo slot ha ancora una coppia di trade aperta. Chiudila prima di cancellare la card.",
+      const slotAccountsResult = await client.query<SlotAccountRow>(
+        `
+          select account_type, metaapi_account_id
+          from trading_accounts
+          where slot_id = $1
+            and user_id = $2
+        `,
+        [slotId, userId],
       );
+
+      const symbol = openTradePairResult.rows[0]?.symbol ?? null;
+      const livePositions = await Promise.all(
+        slotAccountsResult.rows
+          .map((row) => row.metaapi_account_id)
+          .filter(Boolean)
+          .map((accountId) => getMetaApiOpenPositions(accountId!, { symbol })),
+      );
+
+      const hasRealOpenPositions = livePositions.some((positions) => positions.length > 0);
+
+      if (hasRealOpenPositions) {
+        throw new Error(
+          "Questo slot ha ancora una coppia di trade aperta. Chiudila prima di cancellare la card.",
+        );
+      }
     }
 
     const slot = slotResult.rows[0]!;

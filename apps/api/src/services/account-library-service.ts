@@ -31,6 +31,7 @@ type SavedAccountRow = {
   balance: string | null;
   equity: string | null;
   last_validated_at: string | null;
+  deleted_at: string | null;
   created_at: string;
 };
 
@@ -100,6 +101,25 @@ function mapSavedAccountRow(row: SavedAccountRow): SavedAccountSnapshot {
   } as SavedAccountSnapshot;
 }
 
+function isMetaApiConnectionFailureStatus(status: string | null | undefined) {
+  return (
+    status === "ACCOUNT_FAILED" ||
+    status === "BROKER_CONNECTION_FAILED" ||
+    status === "DISCONNECTED_FROM_BROKER"
+  );
+}
+
+function shouldRefreshPendingSavedAccount(row: SavedAccountRow) {
+  if (row.deleted_at) return false;
+  if (row.connection_state !== "pending") return false;
+  if (!row.last_validated_at) return true;
+
+  const lastValidatedAt = Date.parse(row.last_validated_at);
+  if (Number.isNaN(lastValidatedAt)) return true;
+
+  return Date.now() - lastValidatedAt >= 15_000;
+}
+
 async function findMatchingSavedAccountRow(
   client: PoolClient,
   userId: string,
@@ -124,6 +144,7 @@ async function findMatchingSavedAccountRow(
         balance::text,
         equity::text,
         last_validated_at::text,
+        deleted_at::text,
         created_at::text
       from saved_accounts
       where user_id = $1
@@ -190,6 +211,7 @@ export async function upsertSavedAccountForUser(
           balance = $12,
           equity = $13,
           last_validated_at = $14,
+          deleted_at = null,
           updated_at = now()
         where id = $1
         returning
@@ -209,6 +231,7 @@ export async function upsertSavedAccountForUser(
           balance::text,
           equity::text,
           last_validated_at::text,
+          deleted_at::text,
           created_at::text
       `,
       [
@@ -286,6 +309,7 @@ export async function upsertSavedAccountForUser(
         balance::text,
         equity::text,
         last_validated_at::text,
+        deleted_at::text,
         created_at::text
     `,
     [
@@ -389,6 +413,96 @@ async function validateSavedAccountConnection(
   }
 }
 
+async function refreshSavedAccountConnection(
+  client: PoolClient,
+  userId: string,
+  row: SavedAccountRow,
+) {
+  const input: SavedAccountInput = {
+    label: row.label,
+    accountType: row.account_type,
+    platform: row.platform,
+    accountName:
+      row.account_type === "BROKER"
+        ? row.account_name ?? "Broker"
+        : row.account_name ?? "FundingPips Prop",
+    login: decryptSecret(row.login_ciphertext),
+    password: decryptSecret(row.password_ciphertext),
+    server: decryptSecret(row.server_ciphertext),
+    lotStep: Number(row.broker_lot_step ?? 0.01),
+  };
+
+  const lastValidatedAt = new Date().toISOString();
+
+  if (row.metaapi_account_id) {
+    try {
+      const snapshot = await getMetaApiAccountConnectionSnapshot(row.metaapi_account_id);
+
+      if (snapshot.connectionStatus === "CONNECTED") {
+        const metrics = await getMetaApiAccountLiveMetrics(row.metaapi_account_id);
+        return await upsertSavedAccountForUser(client, userId, input, {
+          preserveExistingLabel: true,
+          validation: {
+            metaApiAccountId: row.metaapi_account_id,
+            connectionState: "connected",
+            validationMessage: null,
+            connectionStatus: metrics.connectionStatus,
+            balance: metrics.balance,
+            equity: metrics.equity,
+            lastValidatedAt,
+          },
+        });
+      }
+
+      if (isMetaApiConnectionFailureStatus(snapshot.connectionStatus)) {
+        return await upsertSavedAccountForUser(client, userId, input, {
+          preserveExistingLabel: true,
+          validation: {
+            metaApiAccountId: row.metaapi_account_id,
+            connectionState: "error",
+            validationMessage:
+              row.validation_message ??
+              "MetaApi segnala un problema di connessione. Controlla credenziali e server.",
+            connectionStatus: snapshot.connectionStatus,
+            balance: null,
+            equity: null,
+            lastValidatedAt,
+          },
+        });
+      }
+
+      return await upsertSavedAccountForUser(client, userId, input, {
+        preserveExistingLabel: true,
+        validation: {
+          metaApiAccountId: row.metaapi_account_id,
+          connectionState: "pending",
+          validationMessage: "Connessione MetaApi in corso...",
+          connectionStatus: snapshot.connectionStatus,
+          balance: null,
+          equity: null,
+          lastValidatedAt,
+        },
+      });
+    } catch (error) {
+      logger.warn(
+        { error, savedAccountId: row.id, metaApiAccountId: row.metaapi_account_id },
+        "Unable to refresh saved account from existing MetaApi account, retrying validation",
+      );
+    }
+  }
+
+  const validation = await validateSavedAccountConnection(
+    row.id,
+    input,
+    row.metaapi_account_id,
+  );
+
+  return await upsertSavedAccountForUser(client, userId, input, {
+    preserveExistingLabel: true,
+    validation,
+  });
+}
+
 export async function listSavedAccountsForUser(userId: string) {
   const client = await pool.connect();
   try {
@@ -421,25 +535,32 @@ export async function listSavedAccountsForUser(userId: string) {
         continue;
       }
 
+      const backfillInput: SavedAccountInput = {
+        label:
+          row.account_type === "PROP"
+            ? row.challenge ?? "FundingPips Prop"
+            : row.account_name ?? "Broker",
+        accountType: row.account_type,
+        platform: row.platform,
+        accountName:
+          row.account_type === "BROKER"
+            ? row.account_name ?? "Broker"
+            : "FundingPips Prop",
+        login: decryptSecret(row.login_ciphertext),
+        password: decryptSecret(row.password_ciphertext),
+        server: decryptSecret(row.server_ciphertext),
+        lotStep: Number(row.broker_lot_step ?? 0.01),
+      };
+
+      const matchingRow = await findMatchingSavedAccountRow(client, userId, backfillInput);
+      if (matchingRow?.deleted_at) {
+        continue;
+      }
+
       await upsertSavedAccountForUser(
         client,
         userId,
-        {
-          label:
-            row.account_type === "PROP"
-              ? row.challenge ?? "FundingPips Prop"
-              : row.account_name ?? "Broker",
-          accountType: row.account_type,
-          platform: row.platform,
-          accountName:
-            row.account_type === "BROKER"
-              ? row.account_name ?? "Broker"
-              : "FundingPips Prop",
-          login: decryptSecret(row.login_ciphertext),
-          password: decryptSecret(row.password_ciphertext),
-          server: decryptSecret(row.server_ciphertext),
-          lotStep: Number(row.broker_lot_step ?? 0.01),
-        },
+        backfillInput,
         {
           preserveExistingLabel: true,
           validation: {
@@ -471,15 +592,61 @@ export async function listSavedAccountsForUser(userId: string) {
           balance::text,
           equity::text,
           last_validated_at::text,
+          deleted_at::text,
           created_at::text
         from saved_accounts
         where user_id = $1
+          and deleted_at is null
         order by created_at desc
       `,
       [userId],
     );
 
-    return result.rows.map(mapSavedAccountRow);
+    for (const row of result.rows) {
+      if (!shouldRefreshPendingSavedAccount(row)) {
+        continue;
+      }
+
+      try {
+        await refreshSavedAccountConnection(client, userId, row);
+      } catch (error) {
+        logger.warn(
+          { error, savedAccountId: row.id, userId },
+          "Unable to refresh pending saved account connection",
+        );
+      }
+    }
+
+    const refreshedResult = await client.query<SavedAccountRow>(
+      `
+        select
+          id,
+          label,
+          account_type,
+          platform,
+          account_name,
+          login_ciphertext,
+          password_ciphertext,
+          server_ciphertext,
+          broker_lot_step::text,
+          metaapi_account_id,
+          connection_state,
+          validation_message,
+          connection_status,
+          balance::text,
+          equity::text,
+          last_validated_at::text,
+          deleted_at::text,
+          created_at::text
+        from saved_accounts
+        where user_id = $1
+          and deleted_at is null
+        order by created_at desc
+      `,
+      [userId],
+    );
+
+    return refreshedResult.rows.map(mapSavedAccountRow);
   } finally {
     client.release();
   }
@@ -560,9 +727,10 @@ export async function getSavedAccountForImport(
         balance::text,
         equity::text,
         last_validated_at::text,
+        deleted_at::text,
         created_at::text
       from saved_accounts
-      where id = $1 and user_id = $2 and account_type = $3
+      where id = $1 and user_id = $2 and account_type = $3 and deleted_at is null
       limit 1
     `,
     [savedAccountId, userId, accountType],
