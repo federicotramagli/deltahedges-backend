@@ -649,7 +649,7 @@ export function startEquityWatcher(intervalMs: number) {
   void tickEquityWatcher();
   watcherTimer = setInterval(() => {
     void tickEquityWatcher();
-  }, Math.max(intervalMs, 1000));
+  }, Math.max(intervalMs, 500));
 }
 
 export function stopEquityWatcher() {

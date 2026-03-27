@@ -12,8 +12,12 @@ import {
   getMetaApiOpenPositions,
   getMetaApiAccountLiveMetrics,
   getMetaApiAccountConnectionSnapshot,
+  getMetaApiSymbolPrice,
+  getMetaApiSymbolSpecification,
   closeMetaApiPositions,
   submitMetaApiTrade,
+  updateMetaApiPositionProtection,
+  waitForMetaApiPosition,
 } from "../services/metaapi-service.js";
 import {
   closeOpenTradePairForSlot,
@@ -175,26 +179,111 @@ function assertAccountConnected(
   );
 }
 
-function buildPropProtectionLevels(params: {
+function buildPropProtectionBudget(params: {
   challenge: ChallengeName;
   phase: "Fase 1" | "Fase 2" | "Funded";
   riskPerTrade: number;
+  currentEquity: number;
 }) {
   const startingBalance = getChallengeAccountSize(params.challenge);
+  const stopFloorEquity = startingBalance * (1 - params.riskPerTrade / 100);
+  const targetEquity =
+    params.phase === "Fase 1"
+      ? Number((startingBalance * 1.08).toFixed(2))
+      : params.phase === "Fase 2"
+        ? Number((startingBalance * 1.05).toFixed(2))
+        : null;
   const stopLossCurrency = Number(
-    (startingBalance * (params.riskPerTrade / 100)).toFixed(2),
+    Math.max(0, params.currentEquity - stopFloorEquity).toFixed(2),
   );
   const takeProfitCurrency =
-    params.phase === "Fase 1"
-      ? Number((startingBalance * 0.08).toFixed(2))
-      : params.phase === "Fase 2"
-        ? Number((startingBalance * 0.05).toFixed(2))
-        : null;
+    targetEquity === null
+      ? null
+      : Number(Math.max(0, targetEquity - params.currentEquity).toFixed(2));
 
   return {
     startingBalance,
+    stopFloorEquity: Number(stopFloorEquity.toFixed(2)),
+    currentEquity: Number(params.currentEquity.toFixed(2)),
+    targetEquity,
     stopLossCurrency,
     takeProfitCurrency,
+  };
+}
+
+function roundPriceToTick(
+  price: number,
+  tickSize: number,
+  mode: "up" | "down",
+) {
+  const scaled = price / tickSize;
+  const rounded =
+    mode === "up" ? Math.ceil(scaled + 1e-9) : Math.floor(scaled - 1e-9);
+  return Number((rounded * tickSize).toFixed(6));
+}
+
+function buildAbsoluteProtectionLevels(params: {
+  entryPrice: number;
+  direction: "BUY" | "SELL";
+  volume: number;
+  tickSize: number;
+  profitTickValue: number;
+  lossTickValue: number;
+  stopLossCurrency: number;
+  takeProfitCurrency: number | null;
+}) {
+  if (params.volume <= 0) {
+    throw new Error("Invalid prop volume for protection calculation");
+  }
+
+  if (params.tickSize <= 0) {
+    throw new Error("Invalid tick size for protection calculation");
+  }
+
+  if (params.lossTickValue <= 0 || params.profitTickValue <= 0) {
+    throw new Error("Invalid tick values for protection calculation");
+  }
+
+  const stopLossDistance =
+    (params.stopLossCurrency * params.tickSize) /
+    (params.lossTickValue * params.volume);
+  const takeProfitDistance =
+    params.takeProfitCurrency === null
+      ? null
+      : (params.takeProfitCurrency * params.tickSize) /
+          (params.profitTickValue * params.volume) +
+        params.tickSize * 100;
+
+  const stopLoss =
+    params.direction === "BUY"
+      ? roundPriceToTick(params.entryPrice - stopLossDistance, params.tickSize, "down")
+      : roundPriceToTick(params.entryPrice + stopLossDistance, params.tickSize, "up");
+  const takeProfit =
+    takeProfitDistance === null
+      ? null
+      : params.direction === "BUY"
+        ? roundPriceToTick(
+            params.entryPrice + takeProfitDistance,
+            params.tickSize,
+            "up",
+          )
+        : roundPriceToTick(
+            params.entryPrice - takeProfitDistance,
+            params.tickSize,
+            "down",
+          );
+
+  return {
+    stopLoss,
+    takeProfit,
+    stopLossDistance: Number(stopLossDistance.toFixed(6)),
+    takeProfitDistance:
+      takeProfitDistance === null ? null : Number(takeProfitDistance.toFixed(6)),
+    takeProfitPoints:
+      params.takeProfitCurrency === null
+        ? null
+        : Number((takeProfitDistance! / params.tickSize).toFixed(2)),
+    stopLossPoints: Number((stopLossDistance / params.tickSize).toFixed(2)),
   };
 }
 
@@ -415,18 +504,20 @@ debugRouter.post("/test-execution", async (request, response, next) => {
   const propDirection = parsed.direction;
   const brokerDirection = propDirection === "BUY" ? "SELL" : "BUY";
   const symbol = parsed.symbol.trim().toUpperCase();
-  const slotSnapshot = await getSlotById(authedRequest.auth.userId, parsed.slotId).catch(() => null);
+  const slotSnapshot = await getSlotById(authedRequest.auth.userId, parsed.slotId).catch(
+    () => null,
+  );
   const riskPerTrade = slotSnapshot?.riskPerTrade ?? 1.5;
-  const propProtection = buildPropProtectionLevels({
-    challenge: parsed.challenge,
-    phase: parsed.phase,
-    riskPerTrade,
-  });
 
   void (async () => {
-    const [propSnapshot, brokerSnapshot] = await Promise.all([
+    const [propSnapshot, brokerSnapshot, propPreTradeMetrics, existingPropPositions] =
+      await Promise.all([
       withStage("prop status", () => getMetaApiAccountConnectionSnapshot(propAccountId)),
       withStage("broker status", () => getMetaApiAccountConnectionSnapshot(brokerAccountId)),
+      withStage("prop pre-trade metrics", () => getMetaApiAccountLiveMetrics(propAccountId)),
+      withStage("prop existing positions", () =>
+        getMetaApiOpenPositions(propAccountId, { symbol }),
+      ),
     ]);
 
     await withStage("prop connected check", async () => {
@@ -436,6 +527,30 @@ debugRouter.post("/test-execution", async (request, response, next) => {
       assertAccountConnected("broker", brokerSnapshot);
     });
 
+    if (propPreTradeMetrics.equity === null) {
+      throw new Error("Prop live equity unavailable. Wait for a stable MetaApi connection.");
+    }
+
+    const propProtectionBudget = buildPropProtectionBudget({
+      challenge: parsed.challenge,
+      phase: parsed.phase,
+      riskPerTrade,
+      currentEquity: propPreTradeMetrics.equity,
+    });
+
+    if (propProtectionBudget.takeProfitCurrency !== null &&
+        propProtectionBudget.takeProfitCurrency <= 0) {
+      throw new Error(
+        `Prop equity is already at or above the ${parsed.phase} target (${propPreTradeMetrics.equity.toFixed(2)} >= ${propProtectionBudget.targetEquity?.toFixed(2) ?? "target"})`,
+      );
+    }
+
+    if (propProtectionBudget.stopLossCurrency <= 0) {
+      throw new Error(
+        `Prop equity is already at or below the configured risk floor (${propPreTradeMetrics.equity.toFixed(2)} <= ${propProtectionBudget.stopFloorEquity.toFixed(2)})`,
+      );
+    }
+
     const [propTradeResult, brokerTradeResult] = await Promise.allSettled([
       withStage("prop trade", () =>
         submitMetaApiTrade({
@@ -443,12 +558,6 @@ debugRouter.post("/test-execution", async (request, response, next) => {
           symbol,
           direction: propDirection,
           volume: propLot,
-          stopLoss: propProtection.stopLossCurrency,
-          stopLossUnits: "RELATIVE_CURRENCY",
-          takeProfit: propProtection.takeProfitCurrency,
-          takeProfitUnits: propProtection.takeProfitCurrency
-            ? "RELATIVE_CURRENCY"
-            : null,
         }),
       ),
       withStage("broker trade", () =>
@@ -465,13 +574,64 @@ debugRouter.post("/test-execution", async (request, response, next) => {
       propTradeResult.status === "fulfilled" &&
       brokerTradeResult.status === "fulfilled"
     ) {
+      let propProtectionLevels:
+        | ReturnType<typeof buildAbsoluteProtectionLevels>
+        | null = null;
+      let propPositionId: string | null = null;
+
       try {
+        const [propPosition, propSymbolPrice, propSymbolSpecification] =
+          await Promise.all([
+            withStage("prop position tracking", () =>
+              waitForMetaApiPosition(propAccountId, {
+                symbol,
+                direction: propDirection,
+                excludePositionIds: existingPropPositions.map((position) => position.id),
+                retries: 30,
+                delayMs: 500,
+              }),
+            ),
+            withStage("prop symbol price", () =>
+              getMetaApiSymbolPrice(propAccountId, symbol),
+            ),
+            withStage("prop symbol specification", () =>
+              getMetaApiSymbolSpecification(propAccountId, symbol),
+            ),
+          ]);
+
+        if (propPosition.openPrice === null) {
+          throw new Error("Prop open price unavailable after trade execution");
+        }
+
+        propPositionId = propPosition.id;
+        propProtectionLevels = buildAbsoluteProtectionLevels({
+          entryPrice: propPosition.openPrice,
+          direction: propDirection,
+          volume: propLot,
+          tickSize: propSymbolSpecification.tickSize,
+          profitTickValue: propSymbolPrice.profitTickValue,
+          lossTickValue: propSymbolPrice.lossTickValue,
+          stopLossCurrency: propProtectionBudget.stopLossCurrency,
+          takeProfitCurrency: propProtectionBudget.takeProfitCurrency,
+        });
+
+        const protectionLevels = propProtectionLevels;
+
+        await withStage("prop protection update", () =>
+          updateMetaApiPositionProtection({
+            accountId: propAccountId,
+            positionId: propPosition.id,
+            stopLoss: protectionLevels.stopLoss,
+            takeProfit: protectionLevels.takeProfit,
+          }),
+        );
+
         await withStage("trade pair persistence", () =>
           recordOpenedTradePair(authedRequest.auth.userId, parsed.slotId, {
             phase: parsed.phase,
             symbol,
             direction: propDirection,
-            propTicketId: propTradeResult.value.orderId ?? null,
+            propTicketId: propPositionId ?? propTradeResult.value.orderId ?? null,
             brokerTicketId: brokerTradeResult.value.orderId ?? null,
             propLotSize: propLot,
             brokerLotRaw: brokerLot.raw,
@@ -500,8 +660,15 @@ debugRouter.post("/test-execution", async (request, response, next) => {
         brokerDirection,
         propLot,
         brokerLot: brokerLot.rounded,
-        propStopLossCurrency: propProtection.stopLossCurrency,
-        propTakeProfitCurrency: propProtection.takeProfitCurrency,
+        propCurrentEquity: propProtectionBudget.currentEquity,
+        propTargetEquity: propProtectionBudget.targetEquity,
+        propStopFloorEquity: propProtectionBudget.stopFloorEquity,
+        propStopLossCurrency: propProtectionBudget.stopLossCurrency,
+        propTakeProfitCurrency: propProtectionBudget.takeProfitCurrency,
+        propStopLossPrice: propProtectionLevels?.stopLoss ?? null,
+        propTakeProfitPrice: propProtectionLevels?.takeProfit ?? null,
+        propStopLossPoints: propProtectionLevels?.stopLossPoints ?? null,
+        propTakeProfitPoints: propProtectionLevels?.takeProfitPoints ?? null,
         propTrade: propTradeResult.value,
         brokerTrade: brokerTradeResult.value,
       });

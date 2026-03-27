@@ -52,12 +52,46 @@ interface MetaApiAccountInformationDto {
 
 interface MetaApiPositionDto {
   id?: string | number;
+  type?: string;
   symbol?: string;
+  time?: string;
+  updateTime?: string;
+  openPrice?: number | string;
 }
 
 export interface MetaApiOpenPositionSnapshot {
   id: string;
   symbol: string;
+  type: "POSITION_TYPE_BUY" | "POSITION_TYPE_SELL" | null;
+  time: string | null;
+  updateTime: string | null;
+  openPrice: number | null;
+}
+
+interface MetaApiSymbolPriceDto {
+  symbol?: string;
+  bid?: number | string;
+  ask?: number | string;
+  profitTickValue?: number | string;
+  lossTickValue?: number | string;
+}
+
+interface MetaApiSymbolSpecificationDto {
+  symbol?: string;
+  tickSize?: number | string;
+}
+
+export interface MetaApiSymbolPriceSnapshot {
+  symbol: string;
+  bid: number;
+  ask: number;
+  profitTickValue: number;
+  lossTickValue: number;
+}
+
+export interface MetaApiSymbolSpecificationSnapshot {
+  symbol: string;
+  tickSize: number;
 }
 
 export interface MetaApiAccountLiveMetricsSnapshot
@@ -117,6 +151,13 @@ export interface SubmitMetaApiTradeResult {
 export interface CloseMetaApiPositionsResult {
   matchedPositions: number;
   closedPositions: number;
+}
+
+export interface UpdateMetaApiPositionProtectionInput {
+  accountId: string;
+  positionId: string;
+  stopLoss?: number | null;
+  takeProfit?: number | null;
 }
 
 function createTransactionId() {
@@ -180,6 +221,12 @@ function sleep(ms: number) {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
+}
+
+function toNullableNumber(value: number | string | undefined | null) {
+  if (value === undefined || value === null || value === "") return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 function isMetaApiAccountNotReadyTradeError(message: string) {
@@ -603,6 +650,14 @@ export async function getMetaApiOpenPositions(
       id:
         position.id === undefined || position.id === null ? "" : String(position.id),
       symbol: String(position.symbol ?? "").trim().toUpperCase(),
+      type: (() => {
+        if (position.type === "POSITION_TYPE_BUY") return "POSITION_TYPE_BUY" as const;
+        if (position.type === "POSITION_TYPE_SELL") return "POSITION_TYPE_SELL" as const;
+        return null;
+      })(),
+      time: position.time ?? null,
+      updateTime: position.updateTime ?? null,
+      openPrice: toNullableNumber(position.openPrice),
     }))
     .filter((position) => position.id && position.symbol)
     .filter((position) => {
@@ -654,6 +709,147 @@ export async function closeMetaApiPositions(
     matchedPositions: matchingPositions.length,
     closedPositions,
   };
+}
+
+export async function getMetaApiSymbolPrice(
+  accountId: string,
+  symbol: string,
+): Promise<MetaApiSymbolPriceSnapshot> {
+  const normalizedSymbol = symbol.trim().toUpperCase();
+  const payload = await requestMetaApiClient<MetaApiSymbolPriceDto>(
+    accountId,
+    `/users/current/accounts/${accountId}/symbols/${normalizedSymbol}/current-price?keepSubscription=true`,
+    { method: "GET" },
+  );
+
+  const bid = toNullableNumber(payload?.bid);
+  const ask = toNullableNumber(payload?.ask);
+  const profitTickValue = toNullableNumber(payload?.profitTickValue);
+  const lossTickValue = toNullableNumber(payload?.lossTickValue);
+
+  if (
+    bid === null ||
+    ask === null ||
+    profitTickValue === null ||
+    lossTickValue === null
+  ) {
+    throw new Error(
+      `MetaApi symbol price for ${normalizedSymbol} is missing required quote fields`,
+    );
+  }
+
+  return {
+    symbol: normalizedSymbol,
+    bid,
+    ask,
+    profitTickValue,
+    lossTickValue,
+  };
+}
+
+export async function getMetaApiSymbolSpecification(
+  accountId: string,
+  symbol: string,
+): Promise<MetaApiSymbolSpecificationSnapshot> {
+  const normalizedSymbol = symbol.trim().toUpperCase();
+  const payload = await requestMetaApiClient<MetaApiSymbolSpecificationDto>(
+    accountId,
+    `/users/current/accounts/${accountId}/symbols/${normalizedSymbol}/specification`,
+    { method: "GET" },
+  );
+  const tickSize = toNullableNumber(payload?.tickSize);
+
+  if (tickSize === null || tickSize <= 0) {
+    throw new Error(
+      `MetaApi symbol specification for ${normalizedSymbol} is missing a valid tickSize`,
+    );
+  }
+
+  return {
+    symbol: normalizedSymbol,
+    tickSize,
+  };
+}
+
+export async function waitForMetaApiPosition(
+  accountId: string,
+  options: {
+    symbol?: string | null;
+    direction?: "BUY" | "SELL" | null;
+    excludePositionIds?: string[];
+    retries?: number;
+    delayMs?: number;
+  } = {},
+): Promise<MetaApiOpenPositionSnapshot> {
+  const retries = options.retries ?? 20;
+  const delayMs = options.delayMs ?? 500;
+  const normalizedSymbol = options.symbol?.trim().toUpperCase() || null;
+  const normalizedDirection =
+    options.direction === "BUY"
+      ? "POSITION_TYPE_BUY"
+      : options.direction === "SELL"
+        ? "POSITION_TYPE_SELL"
+        : null;
+  const excludedIds = new Set(options.excludePositionIds ?? []);
+
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    const positions = await getMetaApiOpenPositions(accountId, {
+      symbol: normalizedSymbol,
+    });
+    const matchingPosition = positions
+      .filter((position) => !excludedIds.has(position.id))
+      .filter((position) => {
+        if (!normalizedDirection) return true;
+        return position.type === normalizedDirection;
+      })
+      .sort((left, right) => {
+        const leftTime = Date.parse(left.updateTime ?? left.time ?? "") || 0;
+        const rightTime = Date.parse(right.updateTime ?? right.time ?? "") || 0;
+        return rightTime - leftTime;
+      })[0];
+
+    if (matchingPosition) {
+      return matchingPosition;
+    }
+
+    if (attempt === retries) {
+      throw new Error(
+        `MetaApi position for ${normalizedSymbol ?? "symbol"} was not visible after trade execution`,
+      );
+    }
+
+    await sleep(delayMs);
+  }
+
+  throw new Error("MetaApi position did not become visible after trade execution");
+}
+
+export async function updateMetaApiPositionProtection(
+  input: UpdateMetaApiPositionProtectionInput,
+): Promise<SubmitMetaApiTradeResult> {
+  return requestMetaApiClient<SubmitMetaApiTradeResult>(
+    input.accountId,
+    `/users/current/accounts/${input.accountId}/trade`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        actionType: "POSITION_MODIFY",
+        positionId: input.positionId,
+        ...(input.stopLoss !== undefined && input.stopLoss !== null
+          ? {
+              stopLoss: Number(input.stopLoss.toFixed(2)),
+              stopLossUnits: "ABSOLUTE_PRICE",
+            }
+          : {}),
+        ...(input.takeProfit !== undefined && input.takeProfit !== null
+          ? {
+              takeProfit: Number(input.takeProfit.toFixed(2)),
+              takeProfitUnits: "ABSOLUTE_PRICE",
+            }
+          : {}),
+      }),
+    },
+  ).then((payload) => payload ?? {});
 }
 
 export async function waitUntilMetaApiAccountConnected(
