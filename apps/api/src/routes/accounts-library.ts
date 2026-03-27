@@ -25,7 +25,9 @@ accountsLibraryRouter.get("/", (request, response, next) => {
 accountsLibraryRouter.post("/", (request, response, next) => {
   const authedRequest = request as AuthedRequest;
   const body = savedAccountSchema.parse(request.body);
-  void createSavedAccount(authedRequest.auth.userId, body)
+  void createSavedAccount(authedRequest.auth.userId, body, {
+    email: authedRequest.auth.email,
+  })
     .then((account) => {
       response.status(201).json({ account });
     })

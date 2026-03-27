@@ -37,7 +37,9 @@ slotsRouter.get("/", (request, response, next) => {
 slotsRouter.post("/", (request, response, next) => {
   const authedRequest = request as AuthedRequest;
   const body = createSlotSchema.parse(request.body);
-  void createSlot(authedRequest.auth.userId, body)
+  void createSlot(authedRequest.auth.userId, body, {
+    email: authedRequest.auth.email,
+  })
     .then((slot) => {
       response.status(201).json({ slot });
     })

@@ -14,10 +14,16 @@ import { decryptSecret, encryptSecret } from "./crypto-service.js";
 import {
   ensureSingleMetaApiAccount,
   getMetaApiAccountConnectionSnapshot,
+  getMetaApiAccountLiveMetrics,
   provisionMetaApiAccount,
 } from "./metaapi-service.js";
 import { assignDedicatedProxyForUser } from "./proxy-service.js";
 import { publishRuntimeEvent } from "./runtime-events.js";
+import {
+  allocateSeatForSlot,
+  getSeatAvailabilityForUser,
+  releaseSeatForSlot,
+} from "./seat-service.js";
 import {
   getSavedAccountForImport,
   upsertSavedAccountForUser,
@@ -37,8 +43,14 @@ type SlotRow = {
     | "FUNDED_BREAK_EVEN_READY";
   cycle_state:
     | "FASE_1_ACTIVE"
+    | "FASE_1_PASSED"
+    | "FASE_1_FAILED"
     | "FASE_2_ACTIVE"
+    | "FASE_2_PASSED"
+    | "FASE_2_FAILED"
     | "FUNDED_ACTIVE"
+    | "FUNDED_FAILED"
+    | "FUNDED_PAYOUT"
     | "FUNDED_BREAK_EVEN_READY"
     | "PAUSED_BILLING";
   broker_account_name: string | null;
@@ -57,8 +69,8 @@ type SlotRow = {
   cycle_balance: number | null;
   prop_equity: string | null;
   broker_equity: string | null;
-  prop_unrealized_pnl?: string | null;
-  broker_unrealized_pnl?: string | null;
+  prop_unrealized_pnl: string | null;
+  broker_unrealized_pnl: string | null;
   updated_at: string;
   prop_account_id: string | null;
   broker_account_id: string | null;
@@ -87,6 +99,14 @@ type ReusableTradingAccountRow = {
   login_ciphertext: string | null;
   password_ciphertext: string | null;
   server_ciphertext: string | null;
+};
+
+type SlotParametersRuntimeRow = {
+  challenge: ChallengeName;
+  phase: "Fase 1" | "Fase 2" | "Funded";
+  broker_start_equity: string | null;
+  broker_equity: string | null;
+  broker_metaapi_account_id: string | null;
 };
 
 function sameEncryptedSecret(ciphertext: string | null, plain: string) {
@@ -211,8 +231,17 @@ function mapSlotRowToSnapshot(row: SlotRow): SlotSnapshot {
         ? "partial"
         : "empty";
 
-  const challengeState =
-    row.runtime_status === "RUNNING"
+  const challengeState:
+    | "BOZZA"
+    | "PRONTA"
+    | "ATTIVA"
+    | "PAUSA_BILLING"
+    | "AVAILABLE" =
+    row.cycle_state === "FASE_1_FAILED" ||
+    row.cycle_state === "FASE_2_FAILED" ||
+    row.cycle_state === "FUNDED_FAILED"
+      ? "AVAILABLE"
+      : row.runtime_status === "RUNNING"
       ? "ATTIVA"
       : row.runtime_status === "PAUSED_BILLING"
         ? "PAUSA_BILLING"
@@ -221,7 +250,7 @@ function mapSlotRowToSnapshot(row: SlotRow): SlotSnapshot {
           : "BOZZA";
 
   const phase1BaseTarget = Number(row.phase1_base_target ?? 0);
-  const brokerStartEquity = Number(row.broker_start_equity ?? 0);
+  const brokerStartEquity = Number(row.broker_start_equity ?? row.broker_equity ?? 0);
   const target =
     Number(row.current_target ?? 0) ||
     getEffectiveCycleTarget({
@@ -243,6 +272,7 @@ function mapSlotRowToSnapshot(row: SlotRow): SlotSnapshot {
     challenge: row.challenge,
     phase: row.phase,
     status: row.phase === "Funded" ? "FUNDED" : row.phase === "Fase 2" ? "PRACTITIONER" : "OPEN",
+    cycleState: row.cycle_state,
     challengeState,
     parametersProfile: row.parameters_profile ?? "",
     brokerAccount: row.broker_account_name ?? "",
@@ -287,7 +317,7 @@ function mapSlotRowToSnapshot(row: SlotRow): SlotSnapshot {
       hour: "2-digit",
       minute: "2-digit",
     }),
-  };
+  } as SlotSnapshot;
 }
 
 async function getBillingCountry(client: PoolClient, userId: string) {
@@ -314,43 +344,6 @@ async function getBillingCountry(client: PoolClient, userId: string) {
   );
 
   return result.rows[0]?.billing_country ?? null;
-}
-
-async function allocateSeat(client: PoolClient, userId: string, slotId: string) {
-  const seatResult = await client.query<{ id: string }>(
-    `
-      select ss.id
-      from subscription_seats ss
-      where ss.user_id = $1
-        and ss.status = 'ACTIVE'
-        and not exists (
-          select 1
-          from seat_allocations sa
-          where sa.seat_id = ss.id
-            and sa.released_at is null
-        )
-      order by ss.seat_number asc
-      limit 1
-      for update skip locked
-    `,
-    [userId],
-  );
-
-  if (!seatResult.rowCount) {
-    throw new Error("No paid seat available for this user");
-  }
-
-  const seatId = seatResult.rows[0]!.id;
-
-  await client.query(
-    `
-      insert into seat_allocations (seat_id, user_id, slot_id)
-      values ($1, $2, $3)
-    `,
-    [seatId, userId, slotId],
-  );
-
-  return seatId;
 }
 
 async function querySlotsByUser(client: PoolClient, userId: string) {
@@ -424,10 +417,7 @@ export async function listSlotsForUser(userId: string) {
       `,
       [userId],
     );
-    const seatCountResult = await client.query<{ count: string }>(
-      `select count(*)::text as count from subscription_seats where user_id = $1 and status = 'ACTIVE'`,
-      [userId],
-    );
+    const seatAvailability = await getSeatAvailabilityForUser(client, userId);
 
     return {
       slots,
@@ -437,7 +427,11 @@ export async function listSlotsForUser(userId: string) {
         renewalDate: subscriptionResult.rows[0]?.renewal_date
           ? new Date(subscriptionResult.rows[0].renewal_date).toLocaleDateString("it-IT")
           : "In attesa",
-        slotsIncluded: Number(seatCountResult.rows[0]?.count ?? 0),
+        slotsIncluded: seatAvailability.slotsIncluded,
+        usedSlots: seatAvailability.usedSlots,
+        availableSlots: seatAvailability.availableSlots,
+        canCreateSlot: seatAvailability.availableSlots > 0,
+        canManageAccounts: seatAvailability.availableSlots > 0,
       },
     };
   } finally {
@@ -462,35 +456,41 @@ export async function getSlotById(userId: string, slotId: string) {
 export async function createSlot(
   userId: string,
   input: { slot: string; challenge: ChallengeName; phase: "Fase 1" | "Fase 2" | "Funded" },
+  options?: {
+    email?: string;
+  },
 ) {
   const client = await pool.connect();
   try {
     await client.query("begin");
+    const isAdminUser =
+      typeof options?.email === "string" &&
+      adminEmails.has(options.email.trim().toLowerCase());
+    const nextCycleState =
+      input.phase === "Fase 1"
+        ? "FASE_1_ACTIVE"
+        : input.phase === "Fase 2"
+          ? "FASE_2_ACTIVE"
+          : "FUNDED_ACTIVE";
     const slotResult = await client.query<{ id: string; updated_at: string }>(
       `
         insert into hedging_slots (user_id, slot_name, challenge, phase, runtime_status, cycle_state)
-        values ($1, $2, $3, $4, 'DRAFT', 'FASE_1_ACTIVE')
+        values ($1, $2, $3, $4, 'DRAFT', $5)
         returning id, updated_at
       `,
-      [userId, input.slot, input.challenge, input.phase],
+      [userId, input.slot, input.challenge, input.phase, nextCycleState],
     );
     const slotId = slotResult.rows[0]!.id;
-    let seatId: string | null = null;
-    try {
-      seatId = await allocateSeat(client, userId, slotId);
-    } catch (error) {
-      if (!(error instanceof Error) || error.message !== "No paid seat available for this user") {
-        throw error;
-      }
-    }
-    if (seatId) {
+    if (!isAdminUser) {
+      const seatId = await allocateSeatForSlot(client, userId, slotId);
       await client.query(
         `
           update hedging_slots
-          set seat_id = $2
+          set seat_id = $2,
+              cycle_state = $3
           where id = $1
         `,
-        [slotId, seatId],
+        [slotId, seatId, nextCycleState],
       );
     }
     await client.query(
@@ -713,10 +713,12 @@ export async function upsertSlotAccounts(
 
     const propMetaApiAccountId =
       existingPropAccount?.metaapi_account_id ??
+      savedPropAccount?.metaApiAccountId ??
       reusablePropTradingAccount?.metaapi_account_id ??
       null;
     const brokerMetaApiAccountId =
       existingBrokerAccount?.metaapi_account_id ??
+      savedBrokerAccount?.metaApiAccountId ??
       reusableBrokerTradingAccount?.metaapi_account_id ??
       null;
 
@@ -753,6 +755,11 @@ export async function upsertSlotAccounts(
       brokerMetaApiAccountId,
     );
 
+    const [propMetrics, brokerMetrics] = await Promise.all([
+      getMetaApiAccountLiveMetrics(propMeta.accountId).catch(() => null),
+      getMetaApiAccountLiveMetrics(brokerMeta.accountId).catch(() => null),
+    ]);
+
     await upsertSavedAccountForUser(
       client,
       userId,
@@ -766,7 +773,22 @@ export async function upsertSlotAccounts(
         server: resolvedProp.server,
         lotStep: 0.01,
       },
-      { preserveExistingLabel: true },
+      {
+        preserveExistingLabel: true,
+        validation: {
+          metaApiAccountId: propMeta.accountId,
+          connectionState:
+            propMeta.connectionStatus === "CONNECTED" ? "connected" : "pending",
+          validationMessage:
+            propMeta.connectionStatus === "CONNECTED"
+              ? null
+              : "Conto salvato ma non ancora connesso stabilmente a MetaApi.",
+          connectionStatus: propMetrics?.connectionStatus ?? propMeta.connectionStatus,
+          balance: propMetrics?.balance ?? null,
+          equity: propMetrics?.equity ?? null,
+          lastValidatedAt: new Date().toISOString(),
+        },
+      },
     );
 
     await upsertSavedAccountForUser(
@@ -782,7 +804,22 @@ export async function upsertSlotAccounts(
         server: resolvedBroker.server,
         lotStep: resolvedBroker.lotStep,
       },
-      { preserveExistingLabel: true },
+      {
+        preserveExistingLabel: true,
+        validation: {
+          metaApiAccountId: brokerMeta.accountId,
+          connectionState:
+            brokerMeta.connectionStatus === "CONNECTED" ? "connected" : "pending",
+          validationMessage:
+            brokerMeta.connectionStatus === "CONNECTED"
+              ? null
+              : "Conto salvato ma non ancora connesso stabilmente a MetaApi.",
+          connectionStatus: brokerMetrics?.connectionStatus ?? brokerMeta.connectionStatus,
+          balance: brokerMetrics?.balance ?? null,
+          equity: brokerMetrics?.equity ?? null,
+          lastValidatedAt: new Date().toISOString(),
+        },
+      },
     );
 
     await client.query(
@@ -872,6 +909,21 @@ export async function upsertSlotAccounts(
         resolvedBroker.accountName,
         billingCountry,
         proxy?.id ?? null,
+      ],
+    );
+
+    await client.query(
+      `
+        update slot_runtime
+        set prop_equity = coalesce($2, prop_equity),
+            broker_equity = coalesce($3, broker_equity),
+            updated_at = now()
+        where slot_id = $1
+      `,
+      [
+        slotId,
+        propMetrics?.equity ?? propMetrics?.balance ?? null,
+        brokerMetrics?.equity ?? brokerMetrics?.balance ?? null,
       ],
     );
 
@@ -1177,7 +1229,6 @@ export async function upsertSlotParameters(
   slotId: string,
   input: {
     parametersProfile: string;
-    brokerStartEquity: number;
     hedgeBaseTarget: number;
     riskPerTrade: number;
     maxDailyTrades: number;
@@ -1195,6 +1246,41 @@ export async function upsertSlotParameters(
       throw new Error("Slot not found");
     }
     const row = slot.rows[0]!;
+    const brokerRuntimeState = await client.query<SlotParametersRuntimeRow>(
+      `
+        select
+          hs.challenge,
+          hs.phase,
+          sp.broker_start_equity::text,
+          sr.broker_equity::text,
+          broker.metaapi_account_id as broker_metaapi_account_id
+        from hedging_slots hs
+        left join slot_parameters sp on sp.slot_id = hs.id
+        left join slot_runtime sr on sr.slot_id = hs.id
+        left join trading_accounts broker
+          on broker.slot_id = hs.id and broker.account_type = 'BROKER'
+        where hs.id = $1 and hs.user_id = $2
+        limit 1
+      `,
+      [slotId, userId],
+    );
+    const brokerState = brokerRuntimeState.rows[0]!;
+    let brokerStartEquity = Number(
+      brokerState.broker_start_equity ?? brokerState.broker_equity ?? 0,
+    );
+
+    if (brokerStartEquity <= 0 && brokerState.broker_metaapi_account_id) {
+      const brokerMetrics = await getMetaApiAccountLiveMetrics(
+        brokerState.broker_metaapi_account_id,
+      ).catch(() => null);
+      brokerStartEquity = Number(brokerMetrics?.equity ?? brokerMetrics?.balance ?? 0);
+    }
+
+    if (brokerStartEquity <= 0) {
+      throw new Error(
+        "Balance broker iniziale non disponibile. Collega prima il conto broker nella sezione Conti.",
+      );
+    }
     const currentTarget = getEffectiveCycleTarget({
       challenge: row.challenge,
       phase: row.phase,
@@ -1227,7 +1313,7 @@ export async function upsertSlotParameters(
         slotId,
         input.parametersProfile,
         input.hedgeBaseTarget,
-        input.brokerStartEquity,
+        brokerStartEquity,
         input.riskPerTrade,
         input.maxDailyTrades,
         input.orphanTimeoutMs,
@@ -1243,7 +1329,7 @@ export async function upsertSlotParameters(
             updated_at = now()
         where slot_id = $1
       `,
-      [slotId, currentTarget, currentMultiplier, input.brokerStartEquity],
+      [slotId, currentTarget, currentMultiplier, brokerStartEquity],
     );
 
     await client.query("commit");

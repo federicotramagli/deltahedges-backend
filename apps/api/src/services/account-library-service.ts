@@ -1,7 +1,18 @@
 import type { PoolClient } from "pg";
 import type { SavedAccountSnapshot, TradingAccountType } from "@deltahedge/shared";
 import { pool } from "../db/pool.js";
+import { adminEmails } from "../config.js";
+import { logger } from "../logger.js";
 import { decryptSecret, encryptSecret } from "./crypto-service.js";
+import {
+  getMetaApiAccountConnectionSnapshot,
+  getMetaApiAccountLiveMetrics,
+  provisionMetaApiAccount,
+  waitUntilMetaApiAccountConnected,
+} from "./metaapi-service.js";
+import { assertAvailableSeatForUser } from "./seat-service.js";
+
+type SavedAccountConnectionState = "pending" | "connected" | "error";
 
 type SavedAccountRow = {
   id: string;
@@ -13,6 +24,13 @@ type SavedAccountRow = {
   password_ciphertext: string;
   server_ciphertext: string;
   broker_lot_step: string | null;
+  metaapi_account_id: string | null;
+  connection_state: SavedAccountConnectionState;
+  validation_message: string | null;
+  connection_status: string | null;
+  balance: string | null;
+  equity: string | null;
+  last_validated_at: string | null;
   created_at: string;
 };
 
@@ -25,6 +43,18 @@ type TradingAccountBackfillRow = {
   server_ciphertext: string | null;
   broker_lot_step: string | null;
   challenge: string | null;
+  metaapi_account_id: string | null;
+  connection_status: string | null;
+};
+
+type SavedAccountValidationInput = {
+  metaApiAccountId?: string | null;
+  connectionState?: SavedAccountConnectionState;
+  validationMessage?: string | null;
+  connectionStatus?: string | null;
+  balance?: number | null;
+  equity?: number | null;
+  lastValidatedAt?: string | null;
 };
 
 export interface SavedAccountInput {
@@ -59,8 +89,15 @@ function mapSavedAccountRow(row: SavedAccountRow): SavedAccountSnapshot {
     loginMasked: maskLogin(login),
     server,
     lotStep: Number(row.broker_lot_step ?? 0.01),
+    connectionState: row.connection_state ?? "pending",
+    validationMessage: row.validation_message,
+    connectionStatus: row.connection_status,
+    balance: row.balance === null ? null : Number(row.balance),
+    equity: row.equity === null ? null : Number(row.equity),
+    metaApiAccountId: row.metaapi_account_id,
+    lastValidatedAt: row.last_validated_at,
     createdAt: row.created_at,
-  };
+  } as SavedAccountSnapshot;
 }
 
 async function findMatchingSavedAccountRow(
@@ -80,7 +117,14 @@ async function findMatchingSavedAccountRow(
         password_ciphertext,
         server_ciphertext,
         broker_lot_step::text,
-        created_at
+        metaapi_account_id,
+        connection_state,
+        validation_message,
+        connection_status,
+        balance::text,
+        equity::text,
+        last_validated_at::text,
+        created_at::text
       from saved_accounts
       where user_id = $1
         and account_type = $2
@@ -111,13 +155,17 @@ export async function upsertSavedAccountForUser(
   client: PoolClient,
   userId: string,
   input: SavedAccountInput,
-  options?: { preserveExistingLabel?: boolean },
+  options?: {
+    preserveExistingLabel?: boolean;
+    validation?: SavedAccountValidationInput;
+  },
 ) {
   const normalizedAccountName =
     input.accountType === "BROKER"
       ? input.accountName?.trim() || "Broker"
       : input.accountName?.trim() || "FundingPips Prop";
   const matchingRow = await findMatchingSavedAccountRow(client, userId, input);
+  const validation = options?.validation;
 
   if (matchingRow) {
     const label =
@@ -135,6 +183,13 @@ export async function upsertSavedAccountForUser(
           password_ciphertext = $5,
           server_ciphertext = $6,
           broker_lot_step = $7,
+          metaapi_account_id = $8,
+          connection_state = $9,
+          validation_message = $10,
+          connection_status = $11,
+          balance = $12,
+          equity = $13,
+          last_validated_at = $14,
           updated_at = now()
         where id = $1
         returning
@@ -147,7 +202,14 @@ export async function upsertSavedAccountForUser(
           password_ciphertext,
           server_ciphertext,
           broker_lot_step::text,
-          created_at
+          metaapi_account_id,
+          connection_state,
+          validation_message,
+          connection_status,
+          balance::text,
+          equity::text,
+          last_validated_at::text,
+          created_at::text
       `,
       [
         matchingRow.id,
@@ -157,6 +219,29 @@ export async function upsertSavedAccountForUser(
         encryptSecret(input.password.trim()),
         encryptSecret(input.server.trim()),
         input.accountType === "BROKER" ? input.lotStep ?? 0.01 : 0.01,
+        validation?.metaApiAccountId !== undefined
+          ? validation.metaApiAccountId
+          : matchingRow.metaapi_account_id,
+        validation?.connectionState ?? matchingRow.connection_state ?? "pending",
+        validation?.validationMessage !== undefined
+          ? validation.validationMessage
+          : matchingRow.validation_message,
+        validation?.connectionStatus !== undefined
+          ? validation.connectionStatus
+          : matchingRow.connection_status,
+        validation?.balance !== undefined
+          ? validation.balance
+          : matchingRow.balance === null
+            ? null
+            : Number(matchingRow.balance),
+        validation?.equity !== undefined
+          ? validation.equity
+          : matchingRow.equity === null
+            ? null
+            : Number(matchingRow.equity),
+        validation?.lastValidatedAt !== undefined
+          ? validation.lastValidatedAt
+          : matchingRow.last_validated_at,
       ],
     );
 
@@ -174,9 +259,16 @@ export async function upsertSavedAccountForUser(
         login_ciphertext,
         password_ciphertext,
         server_ciphertext,
-        broker_lot_step
+        broker_lot_step,
+        metaapi_account_id,
+        connection_state,
+        validation_message,
+        connection_status,
+        balance,
+        equity,
+        last_validated_at
       )
-      values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
       returning
         id,
         label,
@@ -187,7 +279,14 @@ export async function upsertSavedAccountForUser(
         password_ciphertext,
         server_ciphertext,
         broker_lot_step::text,
-        created_at
+        metaapi_account_id,
+        connection_state,
+        validation_message,
+        connection_status,
+        balance::text,
+        equity::text,
+        last_validated_at::text,
+        created_at::text
     `,
     [
       userId,
@@ -199,10 +298,95 @@ export async function upsertSavedAccountForUser(
       encryptSecret(input.password.trim()),
       encryptSecret(input.server.trim()),
       input.accountType === "BROKER" ? input.lotStep ?? 0.01 : 0.01,
+      validation?.metaApiAccountId ?? null,
+      validation?.connectionState ?? "pending",
+      validation?.validationMessage ?? null,
+      validation?.connectionStatus ?? null,
+      validation?.balance ?? null,
+      validation?.equity ?? null,
+      validation?.lastValidatedAt ?? null,
     ],
   );
 
   return mapSavedAccountRow(result.rows[0]!);
+}
+
+function deriveBackfillConnectionState(connectionStatus: string | null): SavedAccountConnectionState {
+  if (connectionStatus === "CONNECTED") {
+    return "connected";
+  }
+
+  if (
+    connectionStatus === "ACCOUNT_FAILED" ||
+    connectionStatus === "BROKER_CONNECTION_FAILED" ||
+    connectionStatus === "DISCONNECTED_FROM_BROKER"
+  ) {
+    return "error";
+  }
+
+  return "pending";
+}
+
+async function validateSavedAccountConnection(
+  savedAccountId: string,
+  input: SavedAccountInput,
+  existingMetaApiAccountId?: string | null,
+): Promise<SavedAccountValidationInput> {
+  const lastValidatedAt = new Date().toISOString();
+  let provisionedAccountId = existingMetaApiAccountId ?? null;
+
+  try {
+    const provisioned = await provisionMetaApiAccount({
+      slotId: `saved_account_${savedAccountId}`,
+      accountType: input.accountType,
+      platform: input.platform,
+      login: input.login.trim(),
+      password: input.password.trim(),
+      server: input.server.trim(),
+      existingAccountId: existingMetaApiAccountId,
+    });
+    provisionedAccountId = provisioned.accountId;
+
+    await waitUntilMetaApiAccountConnected(provisioned.accountId, {
+      retries: 20,
+      delayMs: 2000,
+    });
+
+    const metrics = await getMetaApiAccountLiveMetrics(provisioned.accountId);
+
+    return {
+      metaApiAccountId: provisioned.accountId,
+      connectionState: "connected",
+      validationMessage: null,
+      connectionStatus: metrics.connectionStatus,
+      balance: metrics.balance,
+      equity: metrics.equity,
+      lastValidatedAt,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Connessione MetaApi non riuscita";
+    let snapshot:
+      | Awaited<ReturnType<typeof getMetaApiAccountConnectionSnapshot>>
+      | null = null;
+
+    if (provisionedAccountId) {
+      try {
+        snapshot = await getMetaApiAccountConnectionSnapshot(provisionedAccountId);
+      } catch (snapshotError) {
+        logger.warn({ error: snapshotError, savedAccountId }, "Unable to read saved account snapshot after validation error");
+      }
+    }
+
+    return {
+      metaApiAccountId: snapshot?.accountId ?? provisionedAccountId ?? null,
+      connectionState: "error",
+      validationMessage: message,
+      connectionStatus: snapshot?.connectionStatus ?? null,
+      balance: null,
+      equity: null,
+      lastValidatedAt,
+    };
+  }
 }
 
 export async function listSavedAccountsForUser(userId: string) {
@@ -218,6 +402,8 @@ export async function listSavedAccountsForUser(userId: string) {
           ta.password_ciphertext,
           ta.server_ciphertext,
           ta.broker_lot_step::text,
+          ta.metaapi_account_id,
+          ta.connection_status,
           hs.challenge
         from trading_accounts ta
         left join hedging_slots hs
@@ -254,7 +440,15 @@ export async function listSavedAccountsForUser(userId: string) {
           server: decryptSecret(row.server_ciphertext),
           lotStep: Number(row.broker_lot_step ?? 0.01),
         },
-        { preserveExistingLabel: true },
+        {
+          preserveExistingLabel: true,
+          validation: {
+            metaApiAccountId: row.metaapi_account_id,
+            connectionState: deriveBackfillConnectionState(row.connection_status),
+            validationMessage: null,
+            connectionStatus: row.connection_status,
+          },
+        },
       );
     }
 
@@ -270,7 +464,14 @@ export async function listSavedAccountsForUser(userId: string) {
           password_ciphertext,
           server_ciphertext,
           broker_lot_step::text,
-          created_at
+          metaapi_account_id,
+          connection_state,
+          validation_message,
+          connection_status,
+          balance::text,
+          equity::text,
+          last_validated_at::text,
+          created_at::text
         from saved_accounts
         where user_id = $1
         order by created_at desc
@@ -287,10 +488,48 @@ export async function listSavedAccountsForUser(userId: string) {
 export async function createSavedAccount(
   userId: string,
   input: SavedAccountInput,
+  options?: {
+    email?: string;
+  },
 ) {
   const client = await pool.connect();
   try {
-    return await upsertSavedAccountForUser(client, userId, input);
+    const isAdminUser =
+      typeof options?.email === "string" &&
+      adminEmails.has(options.email.trim().toLowerCase());
+
+    if (!isAdminUser) {
+      await assertAvailableSeatForUser(
+        client,
+        userId,
+        "Ti serve almeno uno slot pagato e disponibile prima di collegare nuovi conti.",
+      );
+    }
+
+    const pendingAccount = await upsertSavedAccountForUser(
+      client,
+      userId,
+      input,
+      {
+        validation: {
+          connectionState: "pending",
+          validationMessage: "Validazione MetaApi in corso...",
+          lastValidatedAt: new Date().toISOString(),
+        },
+      },
+    );
+
+    const validation = await validateSavedAccountConnection(
+      pendingAccount.id,
+      input,
+      (pendingAccount as SavedAccountSnapshot & { metaApiAccountId?: string | null })
+        .metaApiAccountId ?? null,
+    );
+
+    return await upsertSavedAccountForUser(client, userId, input, {
+      preserveExistingLabel: true,
+      validation,
+    });
   } finally {
     client.release();
   }
@@ -314,7 +553,14 @@ export async function getSavedAccountForImport(
         password_ciphertext,
         server_ciphertext,
         broker_lot_step::text,
-        created_at
+        metaapi_account_id,
+        connection_state,
+        validation_message,
+        connection_status,
+        balance::text,
+        equity::text,
+        last_validated_at::text,
+        created_at::text
       from saved_accounts
       where id = $1 and user_id = $2 and account_type = $3
       limit 1
@@ -341,5 +587,9 @@ export async function getSavedAccountForImport(
     login: decryptSecret(row.login_ciphertext),
     password: decryptSecret(row.password_ciphertext),
     server: decryptSecret(row.server_ciphertext),
+    metaApiAccountId: row.metaapi_account_id,
+    connectionState: row.connection_state,
+    balance: row.balance === null ? null : Number(row.balance),
+    equity: row.equity === null ? null : Number(row.equity),
   };
 }
