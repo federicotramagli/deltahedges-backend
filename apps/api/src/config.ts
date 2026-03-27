@@ -15,11 +15,11 @@ const envSchema = z.object({
   ENCRYPTION_KEY: z
     .string()
     .min(32, "ENCRYPTION_KEY must be at least 32 chars for AES-256-GCM"),
-  STRIPE_SECRET_KEY: z.string().min(1),
-  STRIPE_WEBHOOK_SECRET: z.string().min(1),
-  STRIPE_PRICE_ID: z.string().min(1),
-  STRIPE_SUCCESS_URL: z.string().url(),
-  STRIPE_CANCEL_URL: z.string().url(),
+  STRIPE_SECRET_KEY: z.string().optional(),
+  STRIPE_WEBHOOK_SECRET: z.string().optional(),
+  STRIPE_PRICE_ID: z.string().optional(),
+  STRIPE_SUCCESS_URL: z.string().url().optional(),
+  STRIPE_CANCEL_URL: z.string().url().optional(),
   METAAPI_ACCESS_TOKEN: z.string().optional(),
   METAAPI_REGION: z.string().default("new-york"),
   METAAPI_DEFAULT_PLATFORM: z.enum(["mt4", "mt5"]).default("mt5"),

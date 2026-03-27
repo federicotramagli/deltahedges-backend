@@ -3,7 +3,13 @@ import { config } from "../config.js";
 import { pool } from "../db/pool.js";
 import { pauseUserSlotsForBilling } from "./slot-service.js";
 
-export const stripe = new Stripe(config.STRIPE_SECRET_KEY);
+function getStripeClient() {
+  if (!config.STRIPE_SECRET_KEY) {
+    throw new Error("Stripe not configured");
+  }
+
+  return new Stripe(config.STRIPE_SECRET_KEY);
+}
 
 type StripeInvoiceWithSubscription = Stripe.Invoice & {
   subscription?: string | Stripe.Subscription | null;
@@ -71,6 +77,11 @@ async function syncSeats(userId: string, subscriptionId: string, quantity: numbe
 }
 
 export async function createCheckoutSession(userId: string, quantity: number) {
+  if (!config.STRIPE_PRICE_ID || !config.STRIPE_SUCCESS_URL || !config.STRIPE_CANCEL_URL) {
+    throw new Error("Stripe checkout not configured");
+  }
+
+  const stripe = getStripeClient();
   const session = await stripe.checkout.sessions.create({
     mode: "subscription",
     success_url: config.STRIPE_SUCCESS_URL,
@@ -93,10 +104,15 @@ export async function createCheckoutSession(userId: string, quantity: number) {
 }
 
 export async function handleStripeWebhook(rawBody: Buffer, signature: string | undefined) {
+  if (!config.STRIPE_WEBHOOK_SECRET) {
+    throw new Error("Stripe webhook not configured");
+  }
+
   if (!signature) {
     throw new Error("Missing Stripe signature");
   }
 
+  const stripe = getStripeClient();
   const event = stripe.webhooks.constructEvent(
     rawBody,
     signature,
