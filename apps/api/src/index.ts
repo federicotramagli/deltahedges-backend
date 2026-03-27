@@ -1,5 +1,6 @@
 import { createServer } from "node:http";
 import { config } from "./config.js";
+import { ensureDatabaseCompatibility } from "./db/compatibility.js";
 import { pool } from "./db/pool.js";
 import { logger } from "./logger.js";
 import { createApp } from "./app.js";
@@ -9,6 +10,8 @@ const app = createApp();
 const server = createServer(app);
 
 attachRuntimeGateway(server);
+
+await ensureDatabaseCompatibility();
 
 server.listen(config.API_PORT, () => {
   logger.info({ port: config.API_PORT }, "DeltaHedge API listening");

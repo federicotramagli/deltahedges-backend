@@ -463,15 +463,24 @@ export async function createSlot(
       [userId, input.slot, input.challenge, input.phase],
     );
     const slotId = slotResult.rows[0]!.id;
-    const seatId = await allocateSeat(client, userId, slotId);
-    await client.query(
-      `
-        update hedging_slots
-        set seat_id = $2
-        where id = $1
-      `,
-      [slotId, seatId],
-    );
+    let seatId: string | null = null;
+    try {
+      seatId = await allocateSeat(client, userId, slotId);
+    } catch (error) {
+      if (!(error instanceof Error) || error.message !== "No paid seat available for this user") {
+        throw error;
+      }
+    }
+    if (seatId) {
+      await client.query(
+        `
+          update hedging_slots
+          set seat_id = $2
+          where id = $1
+        `,
+        [slotId, seatId],
+      );
+    }
     await client.query(
       `
         insert into slot_runtime (slot_id)
