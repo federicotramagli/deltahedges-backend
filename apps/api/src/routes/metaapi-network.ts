@@ -7,6 +7,7 @@ import {
   getMetaApiUserNetworkSnapshot,
   upsertMetaApiUserNetworkPolicy,
 } from "../services/metaapi-network-service.js";
+import { reconcileMetaApiDedicatedIpForUser } from "../services/metaapi-network-reconcile-service.js";
 import { getUserIdByEmail } from "../services/supabase-admin-service.js";
 
 const networkPolicySchema = z
@@ -16,6 +17,20 @@ const networkPolicySchema = z
     preferredRegion: z.string().trim().min(1).optional(),
     userId: z.string().uuid().optional(),
     email: z.string().trim().email().optional(),
+  })
+  .refine((value) => !(value.userId && value.email), {
+    message: "Provide either userId or email, not both",
+    path: ["userId"],
+  });
+
+const networkReconcileSchema = z
+  .object({
+    userId: z.string().uuid().optional(),
+    email: z.string().trim().email().optional(),
+    waitUntilReady: z.coerce.boolean().optional().default(true),
+    dedicatedIpRequired: z.coerce.boolean().optional(),
+    dedicatedIpFamily: z.enum(["ipv4"]).optional(),
+    preferredRegion: z.string().trim().min(1).optional(),
   })
   .refine((value) => !(value.userId && value.email), {
     message: "Provide either userId or email, not both",
@@ -79,6 +94,35 @@ metaApiNetworkRouter.put("/policy", (request, response, next) => {
     )
     .then((policy) => {
       response.json({ policy });
+    })
+    .catch(next);
+});
+
+metaApiNetworkRouter.post("/reconcile", (request, response, next) => {
+  const authedRequest = request as AuthedRequest;
+  const body = networkReconcileSchema.parse(request.body);
+
+  void resolveTargetUser(authedRequest, body)
+    .then(async (target) => {
+      if (body.dedicatedIpRequired !== undefined) {
+        await upsertMetaApiUserNetworkPolicy({
+          userId: target.userId,
+          dedicatedIpRequired: body.dedicatedIpRequired,
+          dedicatedIpFamily: body.dedicatedIpFamily,
+          preferredRegion: body.preferredRegion,
+        });
+      }
+
+      return reconcileMetaApiDedicatedIpForUser(target.userId, {
+        waitUntilReady: body.waitUntilReady,
+      });
+    })
+    .then((results) => {
+      response.json({
+        results,
+        reconciled: results.length,
+        failed: results.filter((item) => item.error).length,
+      });
     })
     .catch(next);
 });

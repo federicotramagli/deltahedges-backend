@@ -1411,6 +1411,7 @@ export async function provisionMetaApiAccount(
 
   const reuseExistingAccount = async (candidateAccountId: string) => {
     const currentAccount = await readMetaApiAccount(candidateAccountId);
+    const expectedStableName = buildMetaApiAccountName(input);
     const snapshot: MetaApiAccountConnectionSnapshot = {
       accountId: candidateAccountId,
       deploymentState: currentAccount.state ?? "UNKNOWN",
@@ -1422,8 +1423,12 @@ export async function provisionMetaApiAccount(
       (!registryRow && shouldRepairMetaApiAccountWithoutRegistry(snapshot));
     const dedicatedIpMismatch =
       networkSettings.dedicatedIpRequired && currentAccount.allocateDedicatedIp !== "ipv4";
+    const identityMismatch = String(currentAccount.name ?? "") !== expectedStableName;
+    const regionMismatch =
+      Boolean(networkSettings.preferredRegion) &&
+      String(currentAccount.region ?? "") !== networkSettings.preferredRegion;
 
-    if (shouldUpdateCredentials || dedicatedIpMismatch) {
+    if (shouldUpdateCredentials || dedicatedIpMismatch || identityMismatch || regionMismatch) {
       await updateMetaApiAccount(candidateAccountId, input, networkSettings);
       return readMetaApiAccount(candidateAccountId);
     }
