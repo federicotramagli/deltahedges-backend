@@ -65,6 +65,7 @@ export async function revokeUserBillingAccess(userId: string) {
         update proxy_pool
         set status = 'AVAILABLE',
             assigned_user_id = null,
+            assigned_at = null,
             updated_at = now()
         where assigned_user_id = $1
       `,

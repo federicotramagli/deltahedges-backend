@@ -16,6 +16,8 @@
     "build:shared": "npm run build -w @deltahedge/shared",
     "build:api": "npm run build -w @deltahedge/shared && npm run build -w @deltahedge/api",
     "build:worker": "npm run build -w @deltahedge/shared && npm run build -w @deltahedge/worker",
+    "import:proxies": "tsx apps/api/src/scripts/import-proxy-file.ts",
+    "assign:proxy": "tsx apps/api/src/scripts/assign-proxy-user.ts",
     "typecheck": "tsc -b packages/shared apps/api apps/worker",
     "test": "tsx --test packages/shared/src/**/*.test.ts"
   },

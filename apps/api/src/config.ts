@@ -29,6 +29,11 @@ const envSchema = z.object({
   METAAPI_DEFAULT_PLATFORM: z.enum(["mt4", "mt5"]).default("mt5"),
   ADMIN_EMAILS: z.string().default("trafede123@gmail.com"),
   EQUITY_WATCHER_INTERVAL_MS: z.coerce.number().default(500),
+  PROXY_STRICT_COUNTRY_MATCH: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((value) => value === "true"),
+  PROXY_VERIFICATION_TIMEOUT_MS: z.coerce.number().default(15000),
   METAAPI_ALLOCATE_DEDICATED_IP: z
     .enum(["true", "false"])
     .default("false")

@@ -10,6 +10,10 @@ import {
   provisionMetaApiAccount,
   waitUntilMetaApiAccountReady,
 } from "./metaapi-service.js";
+import {
+  assignDedicatedProxyForUser,
+  getAssignedProxyForUser,
+} from "./proxy-service.js";
 import { assertAvailableSeatForUser } from "./seat-service.js";
 import { refreshTradingAccountConnectionsForUser } from "./trading-account-connection-service.js";
 
@@ -353,10 +357,37 @@ function deriveBackfillConnectionState(connectionStatus: string | null): SavedAc
   return "pending";
 }
 
+async function getBillingCountry(client: PoolClient, userId: string) {
+  const result = await client.query<{ billing_country: string | null }>(
+    `
+      select billing_country
+      from (
+        select billing_country, updated_at
+        from subscriptions
+        where user_id = $1
+          and status = 'ACTIVE'
+
+        union all
+
+        select billing_country, updated_at
+        from user_profiles
+        where user_id = $1
+      ) sources
+      where billing_country is not null
+      order by updated_at desc nulls last
+      limit 1
+    `,
+    [userId],
+  );
+
+  return result.rows[0]?.billing_country ?? null;
+}
+
 async function validateSavedAccountConnection(
   savedAccountId: string,
   input: SavedAccountInput,
   existingMetaApiAccountId?: string | null,
+  proxyIp?: string | null,
 ): Promise<SavedAccountValidationInput> {
   const lastValidatedAt = new Date().toISOString();
   let provisionedAccountId = existingMetaApiAccountId ?? null;
@@ -369,6 +400,7 @@ async function validateSavedAccountConnection(
       login: input.login.trim(),
       password: input.password.trim(),
       server: input.server.trim(),
+      proxyIp: proxyIp ?? undefined,
       existingAccountId: existingMetaApiAccountId,
     });
     provisionedAccountId = provisioned.accountId;
@@ -693,6 +725,8 @@ export async function createSavedAccount(
       typeof options?.email === "string" &&
       adminEmails.has(options.email.trim().toLowerCase());
 
+    const billingCountry = isAdminUser ? null : await getBillingCountry(client, userId);
+
     if (!isAdminUser) {
       await assertAvailableSeatForUser(
         client,
@@ -700,6 +734,14 @@ export async function createSavedAccount(
         "Ti serve almeno uno slot pagato e disponibile prima di collegare nuovi conti.",
       );
     }
+
+    const proxy = isAdminUser
+      ? await getAssignedProxyForUser(userId, client)
+      : await assignDedicatedProxyForUser({
+          client,
+          userId,
+          billingCountry,
+        });
 
     const pendingAccount = await upsertSavedAccountForUser(
       client,
@@ -719,6 +761,7 @@ export async function createSavedAccount(
       input,
       (pendingAccount as SavedAccountSnapshot & { metaApiAccountId?: string | null })
         .metaApiAccountId ?? null,
+      proxy?.ipAddress ?? null,
     );
 
     return await upsertSavedAccountForUser(client, userId, input, {

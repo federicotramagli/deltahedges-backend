@@ -15,7 +15,10 @@ import {
   getMetaApiAccountLiveMetrics,
   provisionMetaApiAccount,
 } from "./metaapi-service.js";
-import { assignDedicatedProxyForUser } from "./proxy-service.js";
+import {
+  assignDedicatedProxyForUser,
+  getAssignedProxyForUser,
+} from "./proxy-service.js";
 import { publishRuntimeEvent } from "./runtime-events.js";
 import {
   allocateSeatForSlot,
@@ -552,7 +555,7 @@ export async function upsertSlotAccounts(
       adminEmails.has(options.email.trim().toLowerCase());
     const billingCountry = await getBillingCountry(client, userId);
     const proxy = isAdminUser
-      ? null
+      ? await getAssignedProxyForUser(userId, client)
       : await assignDedicatedProxyForUser({
           client,
           userId,
