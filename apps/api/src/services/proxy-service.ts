@@ -319,7 +319,26 @@ export async function upsertProxyInventoryEntry(
     input.notes?.trim() || null,
   ];
 
-  const result = input.id
+  let targetId = input.id ?? null;
+
+  if (!targetId) {
+    const existing = await queryable.query<{ id: string }>(
+      `
+        select id
+        from proxy_pool
+        where provider = $1
+          and upper(country_code) = upper($2)
+          and coalesce(proxy_host, ip_address) = $3
+          and coalesce(proxy_port, -1) = coalesce($4, -1)
+        limit 1
+      `,
+      [input.provider.trim(), countryCode, host, input.port ?? null],
+    );
+
+    targetId = existing.rows[0]?.id ?? null;
+  }
+
+  const result = targetId
     ? await queryable.query<ProxyPoolRow>(
         `
           update proxy_pool
@@ -341,7 +360,7 @@ export async function upsertProxyInventoryEntry(
           where id = $1
           returning ${proxyPoolSelect.replace("select", "")}
         `,
-        [input.id, ...values],
+        [targetId, ...values],
       )
     : await queryable.query<ProxyPoolRow>(
         `
