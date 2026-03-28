@@ -14,6 +14,7 @@ export interface ProxyVerificationSnapshot {
   observedIp: string | null;
   observedCountryCode: string | null;
   observedRegion: string | null;
+  matchesAssignedProxyIp: boolean | null;
   errorMessage: string | null;
   responseBodyPreview: string | null;
 }
@@ -37,11 +38,51 @@ function firstString(record: Record<string, unknown>, keys: string[]) {
   return null;
 }
 
+function findCandidateRecord(value: unknown): Record<string, unknown> | null {
+  if (!value) return null;
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findCandidateRecord(item);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  if (typeof value !== "object") {
+    return null;
+  }
+
+  const record = value as Record<string, unknown>;
+  const directIp = firstString(record, [
+    "ip",
+    "origin",
+    "clientIp",
+    "client_ip",
+    "remoteIp",
+    "remote_ip",
+    "address",
+  ]);
+
+  if (directIp) {
+    return record;
+  }
+
+  for (const nestedValue of Object.values(record)) {
+    const found = findCandidateRecord(nestedValue);
+    if (found) return found;
+  }
+
+  return null;
+}
+
 function extractVerificationFields(
   payload: Record<string, unknown> | null,
   responseBody: string,
 ) {
-  if (!payload) {
+  const candidate = payload ? findCandidateRecord(payload) ?? payload : null;
+
+  if (!candidate) {
     return {
       observedIp: null,
       observedCountryCode: null,
@@ -51,7 +92,7 @@ function extractVerificationFields(
   }
 
   return {
-    observedIp: firstString(payload, [
+    observedIp: firstString(candidate, [
       "ip",
       "origin",
       "clientIp",
@@ -60,12 +101,12 @@ function extractVerificationFields(
       "remote_ip",
       "address",
     ]),
-    observedCountryCode: firstString(payload, [
+    observedCountryCode: firstString(candidate, [
       "countryCode",
       "country_code",
       "country",
     ]),
-    observedRegion: firstString(payload, [
+    observedRegion: firstString(candidate, [
       "region",
       "regionCode",
       "region_code",
@@ -80,6 +121,7 @@ export async function verifyProxyInventoryEntry(params: {
   endpointUrl: string;
   expectedCountryCode?: string | null;
   userId?: string | null;
+  allowInsecureTls?: boolean;
 }) {
   const proxy = await getProxyInventoryEntryById(params.proxyId);
   if (!proxy) {
@@ -102,6 +144,7 @@ export async function verifyProxyInventoryEntry(params: {
       signal: controller.signal,
       dispatcher: new ProxyAgent({
         getProxyForUrl: () => proxy.proxyUrl ?? "",
+        rejectUnauthorized: params.allowInsecureTls ? false : true,
       }),
     } as RequestInit & { dispatcher: ProxyAgent });
 
@@ -110,9 +153,14 @@ export async function verifyProxyInventoryEntry(params: {
     const extracted = extractVerificationFields(parsedPayload, responseBody);
     const expectedCountryCode = params.expectedCountryCode?.trim().toUpperCase() || null;
     const observedCountryCode = extracted.observedCountryCode?.trim().toUpperCase() || null;
+    const expectedProxyIp = proxy.lastSeenPublicIp?.trim() || proxy.host.trim() || null;
+    const observedIp = extracted.observedIp?.trim() || null;
     const countryMatches =
       !expectedCountryCode ||
-      (observedCountryCode !== null && observedCountryCode === expectedCountryCode);
+      observedCountryCode === null ||
+      observedCountryCode === expectedCountryCode;
+    const matchesAssignedProxyIp =
+      expectedProxyIp && observedIp ? observedIp === expectedProxyIp : null;
     const success = response.ok && countryMatches;
 
     const result: ProxyVerificationSnapshot = {
@@ -120,9 +168,10 @@ export async function verifyProxyInventoryEntry(params: {
       endpointUrl: params.endpointUrl,
       success,
       responseStatus: response.status,
-      observedIp: extracted.observedIp,
+      observedIp,
       observedCountryCode,
       observedRegion: extracted.observedRegion,
+      matchesAssignedProxyIp,
       errorMessage: success
         ? null
         : countryMatches
@@ -145,6 +194,7 @@ export async function verifyProxyInventoryEntry(params: {
         metadata: {
           proxyEndpoint: proxy.host,
           proxyProvider: proxy.provider,
+          matchesAssignedProxyIp,
           responseBodyPreview: result.responseBodyPreview,
         },
       },
@@ -172,6 +222,7 @@ export async function verifyProxyInventoryEntry(params: {
       observedIp: null,
       observedCountryCode: null,
       observedRegion: null,
+      matchesAssignedProxyIp: null,
       errorMessage: message,
       responseBodyPreview: null,
     };
@@ -190,6 +241,7 @@ export async function verifyProxyInventoryEntry(params: {
         metadata: {
           proxyEndpoint: proxy.host,
           proxyProvider: proxy.provider,
+          allowInsecureTls: params.allowInsecureTls ?? false,
         },
       },
     );

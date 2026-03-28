@@ -11,6 +11,7 @@ type CliOptions = {
   assignEmail?: string;
   verifyEndpointUrl?: string;
   expectedCountryCode?: string;
+  allowInsecureTls?: boolean;
 };
 
 type ParsedProxyLine = {
@@ -97,6 +98,11 @@ function parseArgs(argv: string[]): CliOptions {
     if (arg === "--expected-country" && next) {
       options.expectedCountryCode = next.trim().toUpperCase();
       index += 1;
+      continue;
+    }
+
+    if (arg === "--allow-insecure-tls") {
+      options.allowInsecureTls = true;
       continue;
     }
   }
@@ -200,6 +206,7 @@ async function main() {
         billingCountry: options.country,
         verifyEndpointUrl: options.verifyEndpointUrl,
         expectedCountryCode: options.expectedCountryCode,
+        allowInsecureTls: options.allowInsecureTls ?? false,
       }),
     });
   }

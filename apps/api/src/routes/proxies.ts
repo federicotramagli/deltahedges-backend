@@ -40,6 +40,7 @@ const proxyVerificationSchema = z.object({
   endpointUrl: z.string().url(),
   expectedCountryCode: z.string().trim().min(2).max(2).optional(),
   userId: z.string().uuid().optional().nullable(),
+  allowInsecureTls: z.coerce.boolean().optional().default(false),
 });
 
 const proxyAssignmentSchema = z
@@ -51,6 +52,7 @@ const proxyAssignmentSchema = z
     metaapiRegion: z.string().trim().min(1).optional(),
     verifyEndpointUrl: z.string().url().optional(),
     expectedCountryCode: z.string().trim().min(2).max(2).optional(),
+    allowInsecureTls: z.coerce.boolean().optional(),
   })
   .refine((value) => Boolean(value.userId || value.email), {
     message: "Provide userId or email",
@@ -161,6 +163,7 @@ proxiesRouter.post("/:proxyId/verify", (request, response, next) => {
     endpointUrl: body.endpointUrl,
     expectedCountryCode: body.expectedCountryCode,
     userId: body.userId ?? authedRequest.auth.userId,
+    allowInsecureTls: body.allowInsecureTls,
   })
     .then((verification) => {
       response.json({ verification });
@@ -199,6 +202,7 @@ proxiesRouter.post("/assign", (request, response, next) => {
               endpointUrl: body.verifyEndpointUrl,
               expectedCountryCode: body.expectedCountryCode,
               userId: target.userId,
+              allowInsecureTls: body.allowInsecureTls,
             })
           : null;
 
