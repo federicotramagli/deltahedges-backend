@@ -115,6 +115,12 @@ export interface MetaApiAccountLiveMetricsSnapshot
   unrealizedPnl: number | null;
 }
 
+type CachedLiveMetricsEntry = {
+  snapshot: MetaApiAccountLiveMetricsSnapshot;
+  expiresAt: number;
+  staleUntil: number;
+};
+
 type MetaApiErrorPayload =
   | string
   | {
@@ -278,6 +284,12 @@ function isMetaApiAccountNotReadyTradeError(message: string) {
   );
 }
 
+function isMetaApiRateLimitError(message: string) {
+  return /cpu credits per 6h|rate limit|overloading our servers|extend your quota|retry your request/i.test(
+    message,
+  );
+}
+
 function formatMetaApiDetails(details: unknown) {
   if (!details) return "";
 
@@ -354,6 +366,56 @@ function toNullableMoney(value: unknown) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) return null;
   return Number(numeric.toFixed(2));
+}
+
+const LIVE_METRICS_CACHE_TTL_MS = 20_000;
+const LIVE_METRICS_EMPTY_TTL_MS = 5_000;
+const LIVE_METRICS_STALE_GRACE_MS = 120_000;
+const liveMetricsCache = new Map<string, CachedLiveMetricsEntry>();
+const liveMetricsInflight = new Map<string, Promise<MetaApiAccountLiveMetricsSnapshot>>();
+
+function cloneLiveMetricsSnapshot(
+  snapshot: MetaApiAccountLiveMetricsSnapshot,
+): MetaApiAccountLiveMetricsSnapshot {
+  return { ...snapshot };
+}
+
+function rememberLiveMetrics(
+  accountId: string,
+  snapshot: MetaApiAccountLiveMetricsSnapshot,
+  ttlMs: number,
+) {
+  const now = Date.now();
+  liveMetricsCache.set(accountId, {
+    snapshot: cloneLiveMetricsSnapshot(snapshot),
+    expiresAt: now + ttlMs,
+    staleUntil: now + LIVE_METRICS_STALE_GRACE_MS,
+  });
+
+  return snapshot;
+}
+
+function getCachedLiveMetrics(
+  accountId: string,
+  options?: { includeStale?: boolean },
+): MetaApiAccountLiveMetricsSnapshot | null {
+  const cached = liveMetricsCache.get(accountId);
+  if (!cached) return null;
+
+  const now = Date.now();
+  if (cached.expiresAt > now) {
+    return cloneLiveMetricsSnapshot(cached.snapshot);
+  }
+
+  if (options?.includeStale && cached.staleUntil > now) {
+    return cloneLiveMetricsSnapshot(cached.snapshot);
+  }
+
+  if (cached.staleUntil <= now) {
+    liveMetricsCache.delete(accountId);
+  }
+
+  return null;
 }
 
 async function readMetaApiRegistryRow(
@@ -798,34 +860,93 @@ export async function getMetaApiAccountConnectionSnapshot(
 export async function getMetaApiAccountLiveMetrics(
   accountId: string,
 ): Promise<MetaApiAccountLiveMetricsSnapshot> {
-  const snapshot = await getMetaApiAccountConnectionSnapshot(accountId);
-
-  if (snapshot.connectionStatus !== "CONNECTED") {
-    return {
-      ...snapshot,
-      balance: null,
-      equity: null,
-      unrealizedPnl: null,
-    };
+  const cached = getCachedLiveMetrics(accountId);
+  if (cached) {
+    return cached;
   }
 
-  const accountInformation = await requestMetaApiClient<MetaApiAccountInformationDto>(
-    accountId,
-    `/users/current/accounts/${accountId}/account-information`,
-    { method: "GET" },
-    { retries: 20, delayMs: 2000 },
-  );
+  const inflight = liveMetricsInflight.get(accountId);
+  if (inflight) {
+    return inflight;
+  }
 
-  const balance = toNullableMoney(accountInformation?.balance);
-  const equity = toNullableMoney(accountInformation?.equity);
+  const task = (async () => {
+    const snapshot = await getMetaApiAccountConnectionSnapshot(accountId);
 
-  return {
-    ...snapshot,
-    balance,
-    equity,
-    unrealizedPnl:
-      balance !== null && equity !== null ? toNullableMoney(equity - balance) : null,
-  };
+    if (snapshot.connectionStatus !== "CONNECTED") {
+      return rememberLiveMetrics(
+        accountId,
+        {
+          ...snapshot,
+          balance: null,
+          equity: null,
+          unrealizedPnl: null,
+        },
+        LIVE_METRICS_EMPTY_TTL_MS,
+      );
+    }
+
+    try {
+      const accountInformation = await requestMetaApiClient<MetaApiAccountInformationDto>(
+        accountId,
+        `/users/current/accounts/${accountId}/account-information`,
+        { method: "GET" },
+        { retries: 4, delayMs: 1500 },
+      );
+
+      const balance = toNullableMoney(accountInformation?.balance);
+      const equity = toNullableMoney(accountInformation?.equity);
+
+      return rememberLiveMetrics(
+        accountId,
+        {
+          ...snapshot,
+          balance,
+          equity,
+          unrealizedPnl:
+            balance !== null && equity !== null
+              ? toNullableMoney(equity - balance)
+              : null,
+        },
+        LIVE_METRICS_CACHE_TTL_MS,
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (isMetaApiRateLimitError(message)) {
+        const stale = getCachedLiveMetrics(accountId, { includeStale: true });
+        if (stale) {
+          logger.warn(
+            { accountId, message },
+            "MetaApi live metrics rate limited, serving stale cached metrics",
+          );
+          return stale;
+        }
+
+        logger.warn(
+          { accountId, message },
+          "MetaApi live metrics rate limited before cache warmup, serving connection snapshot only",
+        );
+
+        return rememberLiveMetrics(
+          accountId,
+          {
+            ...snapshot,
+            balance: null,
+            equity: null,
+            unrealizedPnl: null,
+          },
+          LIVE_METRICS_EMPTY_TTL_MS,
+        );
+      }
+
+      throw error;
+    }
+  })().finally(() => {
+    liveMetricsInflight.delete(accountId);
+  });
+
+  liveMetricsInflight.set(accountId, task);
+  return task;
 }
 
 async function listMetaApiPositions(accountId: string): Promise<MetaApiPositionDto[]> {

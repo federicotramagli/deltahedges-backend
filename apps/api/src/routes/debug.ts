@@ -95,6 +95,29 @@ async function withStage<T>(stage: string, task: () => Promise<T>) {
   }
 }
 
+function toLiveMetricsSideSnapshot(
+  metrics: Awaited<ReturnType<typeof getMetaApiAccountLiveMetrics>> | null,
+) {
+  if (!metrics) {
+    return {
+      ...emptySideSnapshot(),
+      balance: null,
+      equity: null,
+      unrealizedPnl: null,
+    };
+  }
+
+  return {
+    state: mapConnectionState(metrics),
+    deploymentState: metrics.deploymentState,
+    connectionStatus: metrics.connectionStatus,
+    region: metrics.region,
+    balance: metrics.balance,
+    equity: metrics.equity,
+    unrealizedPnl: metrics.unrealizedPnl,
+  };
+}
+
 async function resolveDebugSlotAccounts(
   userId: string,
   parsed:
@@ -377,50 +400,32 @@ debugRouter.post("/live-metrics", async (request, response, next) => {
       storedAccounts.broker?.metaapiAccountId ||
       null;
 
-    const [propMetrics, brokerMetrics] = await Promise.all([
+    const [propMetrics, brokerMetrics] = await Promise.allSettled([
       propAccountId
         ? withStage("prop live metrics", () => getMetaApiAccountLiveMetrics(propAccountId))
-        : Promise.resolve(null),
+        : Promise.resolve(null as Awaited<ReturnType<typeof getMetaApiAccountLiveMetrics>> | null),
       brokerAccountId
         ? withStage("broker live metrics", () => getMetaApiAccountLiveMetrics(brokerAccountId))
-        : Promise.resolve(null),
+        : Promise.resolve(null as Awaited<ReturnType<typeof getMetaApiAccountLiveMetrics>> | null),
     ]);
+
+    const warnings = [propMetrics, brokerMetrics]
+      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+      .map((result) => {
+        const reason = result.reason;
+        return reason instanceof Error ? reason.message : String(reason);
+      });
 
     response.json({
       propMetaApiAccountId: propAccountId,
       brokerMetaApiAccountId: brokerAccountId,
-      prop: propMetrics
-        ? {
-            state: mapConnectionState(propMetrics),
-            deploymentState: propMetrics.deploymentState,
-            connectionStatus: propMetrics.connectionStatus,
-            region: propMetrics.region,
-            balance: propMetrics.balance,
-            equity: propMetrics.equity,
-            unrealizedPnl: propMetrics.unrealizedPnl,
-          }
-        : {
-            ...emptySideSnapshot(),
-            balance: null,
-            equity: null,
-            unrealizedPnl: null,
-          },
-      broker: brokerMetrics
-        ? {
-            state: mapConnectionState(brokerMetrics),
-            deploymentState: brokerMetrics.deploymentState,
-            connectionStatus: brokerMetrics.connectionStatus,
-            region: brokerMetrics.region,
-            balance: brokerMetrics.balance,
-            equity: brokerMetrics.equity,
-            unrealizedPnl: brokerMetrics.unrealizedPnl,
-          }
-        : {
-            ...emptySideSnapshot(),
-            balance: null,
-            equity: null,
-            unrealizedPnl: null,
-          },
+      prop: toLiveMetricsSideSnapshot(
+        propMetrics.status === "fulfilled" ? propMetrics.value : null,
+      ),
+      broker: toLiveMetricsSideSnapshot(
+        brokerMetrics.status === "fulfilled" ? brokerMetrics.value : null,
+      ),
+      warnings,
       fetchedAt: new Date().toISOString(),
     });
   })().catch(next);
