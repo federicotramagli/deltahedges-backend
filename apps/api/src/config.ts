@@ -4,6 +4,23 @@ import { z } from "zod";
 const rawPort =
   process.env.PORT ?? process.env.API_PORT ?? process.env.port ?? "8080";
 
+function parseEnvBoolean(defaultValue: boolean) {
+  return z.preprocess((value) => {
+    if (typeof value === "boolean") {
+      return value;
+    }
+
+    if (typeof value === "string") {
+      const normalized = value.trim().replace(/^['"]|['"]$/g, "").toLowerCase();
+
+      if (normalized === "true") return true;
+      if (normalized === "false") return false;
+    }
+
+    return value;
+  }, z.boolean().default(defaultValue));
+}
+
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   API_PORT: z.coerce.number().default(8080),
@@ -29,15 +46,9 @@ const envSchema = z.object({
   METAAPI_DEFAULT_PLATFORM: z.enum(["mt4", "mt5"]).default("mt5"),
   ADMIN_EMAILS: z.string().default("trafede123@gmail.com"),
   EQUITY_WATCHER_INTERVAL_MS: z.coerce.number().default(5000),
-  PROXY_STRICT_COUNTRY_MATCH: z
-    .enum(["true", "false"])
-    .default("false")
-    .transform((value) => value === "true"),
+  PROXY_STRICT_COUNTRY_MATCH: parseEnvBoolean(false),
   PROXY_VERIFICATION_TIMEOUT_MS: z.coerce.number().default(15000),
-  METAAPI_ALLOCATE_DEDICATED_IP: z
-    .enum(["true", "false"])
-    .default("false")
-    .transform((value) => value === "true"),
+  METAAPI_ALLOCATE_DEDICATED_IP: parseEnvBoolean(false),
   DEV_USER_ID: z.string().optional(),
 });
 
