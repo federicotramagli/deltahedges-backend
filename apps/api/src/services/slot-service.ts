@@ -719,6 +719,7 @@ export async function upsertSlotAccounts(
         ? "reuse"
         : "provision",
       {
+        userId,
         slotId,
         accountType: "PROP",
         platform: resolvedProp.platform,
@@ -735,6 +736,7 @@ export async function upsertSlotAccounts(
         ? "reuse"
         : "provision",
       {
+        userId,
         slotId,
         accountType: "BROKER",
         platform: resolvedBroker.platform,

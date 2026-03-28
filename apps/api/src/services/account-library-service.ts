@@ -384,6 +384,7 @@ async function getBillingCountry(client: PoolClient, userId: string) {
 }
 
 async function validateSavedAccountConnection(
+  userId: string,
   savedAccountId: string,
   input: SavedAccountInput,
   existingMetaApiAccountId?: string | null,
@@ -394,6 +395,7 @@ async function validateSavedAccountConnection(
 
   try {
     const provisioned = await provisionMetaApiAccount({
+      userId,
       slotId: `saved_account_${savedAccountId}`,
       accountType: input.accountType,
       platform: input.platform,
@@ -550,6 +552,7 @@ async function refreshSavedAccountConnection(
   }
 
   const validation = await validateSavedAccountConnection(
+    userId,
     row.id,
     input,
     row.metaapi_account_id,
@@ -757,6 +760,7 @@ export async function createSavedAccount(
     );
 
     const validation = await validateSavedAccountConnection(
+      userId,
       pendingAccount.id,
       input,
       (pendingAccount as SavedAccountSnapshot & { metaApiAccountId?: string | null })

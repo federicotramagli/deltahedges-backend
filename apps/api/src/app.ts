@@ -9,6 +9,7 @@ import { stripeRouter, stripeWebhookRouter } from "./routes/stripe.js";
 import { debugRouter } from "./routes/debug.js";
 import { accountsLibraryRouter } from "./routes/accounts-library.js";
 import { proxiesRouter } from "./routes/proxies.js";
+import { metaApiNetworkRouter } from "./routes/metaapi-network.js";
 
 export function createApp() {
   const app = express();
@@ -45,6 +46,7 @@ export function createApp() {
   app.use("/health", healthRouter);
   app.use("/debug", debugRouter);
   app.use("/accounts-library", accountsLibraryRouter);
+  app.use("/metaapi-network", metaApiNetworkRouter);
   app.use("/proxies", proxiesRouter);
   app.use("/slots", slotsRouter);
   app.use("/performance", performanceRouter);

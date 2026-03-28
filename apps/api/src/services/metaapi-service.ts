@@ -3,6 +3,13 @@ import { config } from "../config.js";
 import { pool } from "../db/pool.js";
 import { logger } from "../logger.js";
 import { encryptSecret } from "./crypto-service.js";
+import {
+  markMetaApiAccountNetworkAssignmentDeleted,
+  recordMetaApiAccountNetworkAssignment,
+  resolveMetaApiDedicatedIpSettingsForUser,
+  updateMetaApiAccountNetworkSnapshot,
+  type MetaApiDedicatedIpSettings,
+} from "./metaapi-network-service.js";
 
 const METAAPI_PROVISIONING_BASE_URL =
   "https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai";
@@ -38,15 +45,21 @@ interface MetaApiAccountDto {
   state?: MetaApiDeploymentState;
   connectionStatus?: MetaApiConnectionStatus;
   region?: string;
+  userId?: string;
+  allocateDedicatedIp?: string | null;
 }
 
 type MetaApiRegistryRow = {
+  owner_user_id: string | null;
   credential_fingerprint: string;
   platform: "mt4" | "mt5";
   login_ciphertext: string;
   server_ciphertext: string;
   password_fingerprint: string | null;
   metaapi_account_id: string | null;
+  dedicated_ip_required: boolean;
+  dedicated_ip_family: string | null;
+  metaapi_region: string | null;
   last_connection_status: string | null;
   last_deployment_state: string | null;
   last_validated_at: string | null;
@@ -131,6 +144,7 @@ type MetaApiErrorPayload =
     };
 
 export interface ProvisionMetaApiAccountInput {
+  userId: string;
   slotId: string;
   accountType: "PROP" | "BROKER";
   platform?: "mt4" | "mt5";
@@ -219,7 +233,12 @@ function buildMetaApiAccountName(input: ProvisionMetaApiAccountInput) {
     .update(normalized.server.toLowerCase())
     .digest("hex")
     .slice(0, 8);
-  return `DeltaHedge ${normalized.platform.toUpperCase()} ${loginPart} ${serverPart}`;
+  const userPart = crypto
+    .createHash("sha1")
+    .update(input.userId)
+    .digest("hex")
+    .slice(0, 8);
+  return `DeltaHedge ${normalized.platform.toUpperCase()} ${loginPart} ${serverPart} u${userPart}`;
 }
 
 function createMagicNumber(input: ProvisionMetaApiAccountInput) {
@@ -227,7 +246,7 @@ function createMagicNumber(input: ProvisionMetaApiAccountInput) {
   const base = crypto
     .createHash("sha1")
     .update(
-      `${normalized.platform.toLowerCase()}:${normalized.login.toLowerCase()}:${normalized.server.toLowerCase()}`,
+      `${input.userId}:${normalized.platform.toLowerCase()}:${normalized.login.toLowerCase()}:${normalized.server.toLowerCase()}`,
     )
     .digest()
     .readUInt32BE(0);
@@ -424,20 +443,25 @@ async function readMetaApiRegistryRow(
   const result = await pool.query<MetaApiRegistryRow>(
     `
       select
+        owner_user_id,
         credential_fingerprint,
         platform,
         login_ciphertext,
         server_ciphertext,
         password_fingerprint,
         metaapi_account_id,
+        dedicated_ip_required,
+        dedicated_ip_family,
+        metaapi_region,
         last_connection_status,
         last_deployment_state,
         last_validated_at::text
       from metaapi_account_registry
-      where credential_fingerprint = $1
+      where owner_user_id = $1
+        and credential_fingerprint = $2
       limit 1
     `,
-    [buildMetaApiCredentialFingerprint(input)],
+    [input.userId, buildMetaApiCredentialFingerprint(input)],
   );
 
   return result.rows[0] ?? null;
@@ -447,6 +471,9 @@ async function upsertMetaApiRegistryRow(
   input: ProvisionMetaApiAccountInput,
   values: {
     metaApiAccountId: string | null;
+    dedicatedIpRequired: boolean;
+    dedicatedIpFamily: "ipv4";
+    metaApiRegion: string;
     connectionStatus?: string | null;
     deploymentState?: string | null;
   },
@@ -455,37 +482,49 @@ async function upsertMetaApiRegistryRow(
   await pool.query(
     `
       insert into metaapi_account_registry (
+        owner_user_id,
         credential_fingerprint,
         platform,
         login_ciphertext,
         server_ciphertext,
         password_fingerprint,
         metaapi_account_id,
+        dedicated_ip_required,
+        dedicated_ip_family,
+        metaapi_region,
         last_connection_status,
         last_deployment_state,
         last_validated_at,
         updated_at
       )
-      values ($1, $2, $3, $4, $5, $6, $7, $8, now(), now())
-      on conflict (credential_fingerprint)
+      values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now(), now())
+      on conflict (owner_user_id, credential_fingerprint)
       do update set
+        owner_user_id = excluded.owner_user_id,
         platform = excluded.platform,
         login_ciphertext = excluded.login_ciphertext,
         server_ciphertext = excluded.server_ciphertext,
         password_fingerprint = excluded.password_fingerprint,
         metaapi_account_id = excluded.metaapi_account_id,
+        dedicated_ip_required = excluded.dedicated_ip_required,
+        dedicated_ip_family = excluded.dedicated_ip_family,
+        metaapi_region = excluded.metaapi_region,
         last_connection_status = excluded.last_connection_status,
         last_deployment_state = excluded.last_deployment_state,
         last_validated_at = now(),
         updated_at = now()
     `,
     [
+      input.userId,
       buildMetaApiCredentialFingerprint(input),
       normalized.platform,
       encryptSecret(normalized.login),
       encryptSecret(normalized.server),
       buildMetaApiPasswordFingerprint(input),
       values.metaApiAccountId,
+      values.dedicatedIpRequired,
+      values.dedicatedIpFamily,
+      values.metaApiRegion,
       values.connectionStatus ?? null,
       values.deploymentState ?? null,
     ],
@@ -520,24 +559,30 @@ function shouldRepairMetaApiAccountWithoutRegistry(
   );
 }
 
-function buildMetaApiCreateAccountPayload(input: ProvisionMetaApiAccountInput) {
+function buildMetaApiCreateAccountPayload(
+  input: ProvisionMetaApiAccountInput,
+  networkSettings: MetaApiDedicatedIpSettings,
+) {
   const payload: Record<string, unknown> = {
     name: buildMetaApiAccountName(input),
     server: input.server,
     password: input.password,
     magic: createMagicNumber(input),
-    region: config.METAAPI_REGION,
+    region: networkSettings.preferredRegion,
     type: "cloud-g2",
   };
 
-  if (config.METAAPI_ALLOCATE_DEDICATED_IP) {
-    payload.allocateDedicatedIp = "ipv4";
+  if (networkSettings.dedicatedIpRequired) {
+    payload.allocateDedicatedIp = networkSettings.dedicatedIpFamily;
   }
 
   return payload;
 }
 
-function buildMetaApiUpdateAccountPayload(input: ProvisionMetaApiAccountInput) {
+function buildMetaApiUpdateAccountPayload(
+  input: ProvisionMetaApiAccountInput,
+  networkSettings: MetaApiDedicatedIpSettings,
+) {
   const payload: Record<string, unknown> = {
     name: buildMetaApiAccountName(input),
     server: input.server,
@@ -545,8 +590,8 @@ function buildMetaApiUpdateAccountPayload(input: ProvisionMetaApiAccountInput) {
     magic: createMagicNumber(input),
   };
 
-  if (config.METAAPI_ALLOCATE_DEDICATED_IP) {
-    payload.allocateDedicatedIp = "ipv4";
+  if (networkSettings.dedicatedIpRequired) {
+    payload.allocateDedicatedIp = networkSettings.dedicatedIpFamily;
   }
 
   return payload;
@@ -625,6 +670,16 @@ async function readMetaApiAccount(accountId: string, retries = 6): Promise<MetaA
     if (!account) {
       throw new Error(`MetaApi account ${accountId} returned empty payload`);
     }
+
+    await updateMetaApiAccountNetworkSnapshot(accountId, {
+      dedicatedIpRequested: account.allocateDedicatedIp === "ipv4",
+      dedicatedIpFamily: account.allocateDedicatedIp === "ipv4" ? "ipv4" : null,
+      metaapiRegion: account.region ?? null,
+      metaapiUserId: account.userId ?? null,
+      deploymentState: account.state ?? null,
+      connectionStatus: account.connectionStatus ?? null,
+    }).catch(() => null);
+
     return account;
   } catch (error) {
     if (retries <= 0) {
@@ -674,6 +729,7 @@ async function findReusableMetaApiAccount(
     if (!accountId) return false;
 
     return (
+      String(account.name ?? "") === stableName &&
       String(account.login ?? "") === String(input.login) &&
       String(account.server ?? "") === String(input.server) &&
       Number(account.version ?? 0) === expectedVersion
@@ -717,12 +773,14 @@ async function cleanupDuplicateMetaApiAccounts(
 ) {
   const accounts = await listMetaApiAccounts();
   const expectedVersion = input.platform === "mt4" ? 4 : 5;
+  const stableName = buildMetaApiAccountName(input);
 
   const duplicates = accounts.filter((account) => {
     const accountId = account._id ?? account.id;
     if (!accountId || accountId === keepAccountId) return false;
 
     return (
+      String(account.name ?? "") === stableName &&
       String(account.login ?? "") === String(input.login) &&
       String(account.server ?? "") === String(input.server) &&
       Number(account.version ?? 0) === expectedVersion
@@ -1259,6 +1317,7 @@ export async function destroyMetaApiAccount(accountId: string) {
     }
   } finally {
     await clearMetaApiRegistryAccountId(accountId).catch(() => null);
+    await markMetaApiAccountNetworkAssignmentDeleted(accountId).catch(() => null);
   }
 }
 
@@ -1288,18 +1347,22 @@ async function configureMetaApiTradingAccount(
 async function updateMetaApiAccount(
   accountId: string,
   input: ProvisionMetaApiAccountInput,
+  networkSettings: MetaApiDedicatedIpSettings,
 ) {
   await requestMetaApi(
     `/users/current/accounts/${accountId}`,
     {
       method: "PUT",
-      body: JSON.stringify(buildMetaApiUpdateAccountPayload(input)),
+      body: JSON.stringify(buildMetaApiUpdateAccountPayload(input, networkSettings)),
     },
   );
   await deployMetaApiAccount(accountId);
 }
 
-async function createMetaApiAccount(input: ProvisionMetaApiAccountInput) {
+async function createMetaApiAccount(
+  input: ProvisionMetaApiAccountInput,
+  networkSettings: MetaApiDedicatedIpSettings,
+) {
   const transactionId = createTransactionId();
 
   const created = await requestMetaApi<MetaApiAccountDto & { id?: string; _id?: string }>(
@@ -1310,7 +1373,7 @@ async function createMetaApiAccount(input: ProvisionMetaApiAccountInput) {
       body: JSON.stringify({
         login: input.login,
         platform: input.platform ?? config.METAAPI_DEFAULT_PLATFORM,
-        ...buildMetaApiCreateAccountPayload(input),
+        ...buildMetaApiCreateAccountPayload(input, networkSettings),
       }),
     },
     { allowAcceptedRetry: true },
@@ -1339,6 +1402,7 @@ export async function provisionMetaApiAccount(
     };
   }
 
+  const networkSettings = await resolveMetaApiDedicatedIpSettingsForUser(input.userId);
   const registryRow = await readMetaApiRegistryRow(input);
   let accountId =
     input.existingAccountId ??
@@ -1346,13 +1410,21 @@ export async function provisionMetaApiAccount(
     null;
 
   const reuseExistingAccount = async (candidateAccountId: string) => {
-    const snapshot = await getMetaApiAccountConnectionSnapshot(candidateAccountId);
+    const currentAccount = await readMetaApiAccount(candidateAccountId);
+    const snapshot: MetaApiAccountConnectionSnapshot = {
+      accountId: candidateAccountId,
+      deploymentState: currentAccount.state ?? "UNKNOWN",
+      connectionStatus: currentAccount.connectionStatus ?? "UNKNOWN",
+      region: currentAccount.region ?? null,
+    };
     const shouldUpdateCredentials =
       shouldUpdateMetaApiCredentials(registryRow, input) ||
       (!registryRow && shouldRepairMetaApiAccountWithoutRegistry(snapshot));
+    const dedicatedIpMismatch =
+      networkSettings.dedicatedIpRequired && currentAccount.allocateDedicatedIp !== "ipv4";
 
-    if (shouldUpdateCredentials) {
-      await updateMetaApiAccount(candidateAccountId, input);
+    if (shouldUpdateCredentials || dedicatedIpMismatch) {
+      await updateMetaApiAccount(candidateAccountId, input, networkSettings);
       return readMetaApiAccount(candidateAccountId);
     }
 
@@ -1361,7 +1433,7 @@ export async function provisionMetaApiAccount(
       return readMetaApiAccount(candidateAccountId);
     }
 
-    return readMetaApiAccount(candidateAccountId);
+    return currentAccount;
   };
 
   if (accountId) {
@@ -1413,7 +1485,7 @@ export async function provisionMetaApiAccount(
   }
 
   if (!accountId) {
-    accountId = await createMetaApiAccount(input);
+    accountId = await createMetaApiAccount(input, networkSettings);
     await deployMetaApiAccount(accountId);
   }
 
@@ -1436,8 +1508,31 @@ export async function provisionMetaApiAccount(
 
   await upsertMetaApiRegistryRow(input, {
     metaApiAccountId: accountId,
+    dedicatedIpRequired: networkSettings.dedicatedIpRequired,
+    dedicatedIpFamily: networkSettings.dedicatedIpFamily,
+    metaApiRegion: networkSettings.preferredRegion,
     connectionStatus,
     deploymentState,
+  });
+
+  await recordMetaApiAccountNetworkAssignment({
+    userId: input.userId,
+    metaapiAccountId: accountId,
+    credentialFingerprint: buildMetaApiCredentialFingerprint(input),
+    accountType: input.accountType,
+    platform: (input.platform ?? config.METAAPI_DEFAULT_PLATFORM) as "mt4" | "mt5",
+    login: input.login,
+    server: input.server,
+    dedicatedIpRequested:
+      account.allocateDedicatedIp === "ipv4" || networkSettings.dedicatedIpRequired,
+    dedicatedIpFamily:
+      account.allocateDedicatedIp === "ipv4" || networkSettings.dedicatedIpRequired
+        ? "ipv4"
+        : null,
+    metaapiRegion: account.region ?? networkSettings.preferredRegion,
+    metaapiUserId: account.userId ?? null,
+    deploymentState,
+    connectionStatus,
   });
 
   await cleanupDuplicateMetaApiAccounts(input, accountId);
