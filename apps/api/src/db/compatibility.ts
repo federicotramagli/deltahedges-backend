@@ -76,7 +76,7 @@ export async function ensureDatabaseCompatibility() {
     await pool.query(`
       create table if not exists metaapi_account_registry (
         id uuid primary key default gen_random_uuid(),
-        credential_fingerprint text not null unique,
+        credential_fingerprint text not null,
         platform text not null default 'mt5',
         login_ciphertext text not null,
         server_ciphertext text not null,
@@ -104,6 +104,11 @@ export async function ensureDatabaseCompatibility() {
         add column if not exists last_connection_status text,
         add column if not exists last_deployment_state text,
         add column if not exists last_validated_at timestamptz
+    `);
+
+    await pool.query(`
+      alter table if exists metaapi_account_registry
+        drop constraint if exists metaapi_account_registry_credential_fingerprint_key
     `);
 
     await pool.query(`

@@ -4,6 +4,9 @@ alter table if exists metaapi_account_registry
   add column if not exists dedicated_ip_family text not null default 'ipv4',
   add column if not exists metaapi_region text;
 
+alter table if exists metaapi_account_registry
+  drop constraint if exists metaapi_account_registry_credential_fingerprint_key;
+
 drop index if exists metaapi_account_registry_fingerprint_idx;
 
 create unique index if not exists metaapi_account_registry_owner_fingerprint_idx
