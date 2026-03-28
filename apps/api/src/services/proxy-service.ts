@@ -191,32 +191,61 @@ export function buildProxyConnectionUrl(input: {
   return `${input.protocol}://${auth}${host}${port}`;
 }
 
-const proxyPoolSelect = `
-  select
-    id,
-    ip_address,
-    country_code,
-    provider,
-    status,
-    assigned_user_id,
-    proxy_host,
-    proxy_port,
-    proxy_protocol,
-    proxy_username_ciphertext,
-    proxy_password_ciphertext,
-    sticky_session_key,
-    sticky_session_ttl_minutes,
-    provider_reference,
-    notes,
-    assigned_at::text,
-    last_verified_at::text,
-    last_verification_status,
-    last_verification_error,
-    last_seen_public_ip,
-    last_seen_country_code,
-    last_seen_region,
-    created_at::text,
-    updated_at::text
+function proxyPoolSelect(alias = "proxy_pool") {
+  return `
+    select
+      ${alias}.id as id,
+      ${alias}.ip_address as ip_address,
+      ${alias}.country_code as country_code,
+      ${alias}.provider as provider,
+      ${alias}.status as status,
+      ${alias}.assigned_user_id as assigned_user_id,
+      ${alias}.proxy_host as proxy_host,
+      ${alias}.proxy_port as proxy_port,
+      ${alias}.proxy_protocol as proxy_protocol,
+      ${alias}.proxy_username_ciphertext as proxy_username_ciphertext,
+      ${alias}.proxy_password_ciphertext as proxy_password_ciphertext,
+      ${alias}.sticky_session_key as sticky_session_key,
+      ${alias}.sticky_session_ttl_minutes as sticky_session_ttl_minutes,
+      ${alias}.provider_reference as provider_reference,
+      ${alias}.notes as notes,
+      ${alias}.assigned_at::text as assigned_at,
+      ${alias}.last_verified_at::text as last_verified_at,
+      ${alias}.last_verification_status as last_verification_status,
+      ${alias}.last_verification_error as last_verification_error,
+      ${alias}.last_seen_public_ip as last_seen_public_ip,
+      ${alias}.last_seen_country_code as last_seen_country_code,
+      ${alias}.last_seen_region as last_seen_region,
+      ${alias}.created_at::text as created_at,
+      ${alias}.updated_at::text as updated_at
+  `;
+}
+
+const proxyPoolReturningColumns = `
+  id,
+  ip_address,
+  country_code,
+  provider,
+  status,
+  assigned_user_id,
+  proxy_host,
+  proxy_port,
+  proxy_protocol,
+  proxy_username_ciphertext,
+  proxy_password_ciphertext,
+  sticky_session_key,
+  sticky_session_ttl_minutes,
+  provider_reference,
+  notes,
+  assigned_at::text,
+  last_verified_at::text,
+  last_verification_status,
+  last_verification_error,
+  last_seen_public_ip,
+  last_seen_country_code,
+  last_seen_region,
+  created_at::text,
+  updated_at::text
 `;
 
 export async function getProxyInventoryEntryById(
@@ -225,7 +254,7 @@ export async function getProxyInventoryEntryById(
 ) {
   const result = await queryable.query<ProxyPoolRow>(
     `
-      ${proxyPoolSelect}
+      ${proxyPoolSelect("proxy_pool")}
       from proxy_pool
       where id = $1
       limit 1
@@ -242,7 +271,7 @@ export async function getAssignedProxyForUser(
 ) {
   const result = await queryable.query<ProxyPoolRow>(
     `
-      ${proxyPoolSelect}
+      ${proxyPoolSelect("p")}
       from user_profiles up
       join proxy_pool p on p.id = up.proxy_id
       where up.user_id = $1
@@ -274,7 +303,7 @@ export async function getAssignedProxyForUser(
 export async function listProxyInventory(queryable: Queryable = pool) {
   const result = await queryable.query<ProxyPoolRow>(
     `
-      ${proxyPoolSelect}
+      ${proxyPoolSelect("proxy_pool")}
       from proxy_pool
       order by upper(country_code) asc, provider asc, created_at asc
     `,
@@ -358,7 +387,7 @@ export async function upsertProxyInventoryEntry(
             notes = $14,
             updated_at = now()
           where id = $1
-          returning ${proxyPoolSelect.replace("select", "")}
+          returning ${proxyPoolReturningColumns}
         `,
         [targetId, ...values],
       )
@@ -380,7 +409,7 @@ export async function upsertProxyInventoryEntry(
             notes
           )
           values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-          returning ${proxyPoolSelect.replace("select", "")}
+          returning ${proxyPoolReturningColumns}
         `,
         values,
       );
@@ -470,7 +499,7 @@ export async function assignDedicatedProxyForUser(params: {
 
   const existing = await params.client.query<ProxyPoolRow>(
     `
-      ${proxyPoolSelect}
+      ${proxyPoolSelect("p")}
       from user_profiles up
       join proxy_pool p on p.id = up.proxy_id
       where up.user_id = $1
@@ -524,7 +553,7 @@ export async function assignDedicatedProxyForUser(params: {
 
   const picked = await params.client.query<ProxyPoolRow>(
     `
-      ${proxyPoolSelect}
+      ${proxyPoolSelect("proxy_pool")}
       from proxy_pool
       where status = 'AVAILABLE'
         and assigned_user_id is null
@@ -544,7 +573,7 @@ export async function assignDedicatedProxyForUser(params: {
   if (!row && !config.PROXY_STRICT_COUNTRY_MATCH) {
     const fallback = await params.client.query<ProxyPoolRow>(
       `
-        ${proxyPoolSelect}
+        ${proxyPoolSelect("proxy_pool")}
         from proxy_pool
         where status = 'AVAILABLE'
           and assigned_user_id is null
@@ -655,7 +684,7 @@ export async function assignSpecificProxyToUser(params: {
 
   const picked = await queryable.query<ProxyPoolRow>(
     `
-      ${proxyPoolSelect}
+      ${proxyPoolSelect("proxy_pool")}
       from proxy_pool
       where id = $1
       limit 1
